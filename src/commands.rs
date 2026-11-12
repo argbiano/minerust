@@ -6,6 +6,8 @@ use crate::{
     java::offline_uuid,
     players::{Color, Event},
     server::{GameMode, Server},
+    wgen,
+    world::Dimension,
 };
 use std::sync::atomic::Ordering;
 use uuid::Uuid;
@@ -48,6 +50,7 @@ pub const COMMANDS: &[Spec] = &[
     Spec { name: "summon", level: 2, usage: "/summon <mob>" },
     Spec { name: "portal", level: 2, usage: "/portal" },
     Spec { name: "time", level: 2, usage: "/time <set <day|noon|night|midnight|ticks>|query>" },
+    Spec { name: "wgen", level: 3, usage: "/wgen <radius> [<x> <z>] [cps] [overworld|nether] | stop | status" },
     Spec { name: "stop", level: 4, usage: "/stop" },
 ];
 
@@ -209,6 +212,26 @@ pub fn execute(server: &Server, source: &Source, line: &str) -> Output {
             server.game.send(Input::SetTime(now - now.rem_euclid(24000) + day_time));
             ok(format!("Set the time to {day_time}"))
         }
+        ("wgen", ["stop"]) => {
+            if server.wgen.stop() {
+                ok("Stopping world generation".into())
+            } else {
+                err("No world generation is running.".into())
+            }
+        }
+        ("wgen", ["status"]) => match server.wgen.status() {
+            Some(p) => ok(format!(
+                "Generating {} around chunk {} {} (radius {}, {} chunks/s max): {}",
+                p.dimension.name(),
+                p.center.0,
+                p.center.1,
+                p.radius,
+                p.cps,
+                p.describe()
+            )),
+            None => ok("No world generation is running.".into()),
+        },
+        ("wgen", args) if !args.is_empty() => wgen(server, source, args).unwrap_or_else(usage),
         ("stop", []) => {
             server.players.broadcast("Server closed", Color::Yellow);
             for p in server.players.all() {
@@ -220,6 +243,68 @@ pub fn execute(server: &Server, source: &Source, line: &str) -> Output {
         }
         _ => usage(),
     }
+}
+
+/// `/wgen <radius> [<x> <z>] [cps] [overworld|nether]`; `None` means bad syntax.
+fn wgen(server: &Server, source: &Source, args: &[&str]) -> Option<Output> {
+    let player = match source {
+        Source::Player { uuid, .. } => server.players.get(*uuid),
+        Source::Console => None,
+    };
+    let (here_dimension, here) = player.as_ref().map_or((Dimension::Overworld, server.spawn), |p| p.location());
+
+    let (dimension, args) = match args.split_last() {
+        Some((last, rest)) => match *last {
+            "overworld" | "minecraft:overworld" => (Dimension::Overworld, rest),
+            "nether" | "the_nether" | "minecraft:the_nether" => (Dimension::Nether, rest),
+            _ => (here_dimension, args),
+        },
+        None => return None,
+    };
+    let numbers: Vec<i64> = args.iter().map(|a| a.parse().ok()).collect::<Option<_>>()?;
+    let (radius, block, cps) = match numbers[..] {
+        [r] => (r, None, None),
+        [r, cps] => (r, None, Some(cps)),
+        [r, x, z] => (r, Some((x, z)), None),
+        [r, x, z, cps] => (r, Some((x, z)), Some(cps)),
+        _ => return None,
+    };
+    if !(0..=wgen::MAX_RADIUS as i64).contains(&radius) {
+        return Some(err(format!("The radius must be between 0 and {} chunks.", wgen::MAX_RADIUS)));
+    }
+    let cps = cps.unwrap_or(wgen::DEFAULT_CPS as i64);
+    if !(1..=wgen::MAX_CPS as i64).contains(&cps) {
+        return Some(err(format!("Chunks per second must be between 1 and {}.", wgen::MAX_CPS)));
+    }
+    let (bx, bz) = match block {
+        Some((x, z)) if x.abs() > 29_999_984 || z.abs() > 29_999_984 => {
+            return Some(err("Those coordinates are outside the world.".into()));
+        }
+        Some((x, z)) => (x as i32, z as i32),
+        // A player's own position, otherwise the world spawn.
+        None => (here[0].floor() as i32, here[2].floor() as i32),
+    };
+
+    let request = wgen::Request {
+        dimension,
+        center: (bx >> 4, bz >> 4),
+        radius: radius as i32,
+        cps: cps as u32,
+        requester: player.map(|p| p.uuid),
+    };
+    Some(match server.wgen.start(request) {
+        Ok(total) => {
+            let bytes = total * wgen::chunk_bytes(server.level(dimension).info().height);
+            let estimate = wgen::format_duration(total as f64 / cps as f64);
+            ok(format!(
+                "Generating {total} chunks of {} around {bx} {bz} (radius {radius}) at up to {cps} chunks/s, \
+                 at least {estimate}. Nothing is saved to disk yet, so they only live in memory (up to about {}).",
+                dimension.name(),
+                wgen::format_bytes(bytes)
+            ))
+        }
+        Err(e) => err(e),
+    })
 }
 
 /// UUID and spelling for a name: the online player's if there is one, otherwise the

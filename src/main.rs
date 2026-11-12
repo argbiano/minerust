@@ -42,6 +42,7 @@ async fn main() -> Result<()> {
     });
 
     tokio::spawn(minerust::game::run(server.clone()));
+    tokio::spawn(minerust::wgen::run(server.clone()));
     tokio::spawn(console::run(server.clone()));
     let java = tokio::spawn(java::listen(server.clone()));
     let bedrock = server.config.bedrock_bind.is_some().then(|| tokio::spawn(bedrock::listen(server.clone())));

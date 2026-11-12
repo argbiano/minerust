@@ -94,6 +94,13 @@ pub fn commands_packet(level: u8) -> Vec<u8> {
                     tree.literal(set, value, true);
                 }
             }
+            "wgen" => {
+                let cmd = tree.literal(0, "wgen", false);
+                tree.literal(cmd, "stop", true);
+                tree.literal(cmd, "status", true);
+                // `<radius> [<x> <z>] [cps] [dimension]` is parsed on the server.
+                tree.arg(cmd, "args", Parser::Greedy);
+            }
             name => {
                 tree.literal(0, name, true);
             }
