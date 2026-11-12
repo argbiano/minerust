@@ -3,6 +3,7 @@ use crate::{
     game,
     players::Players,
     properties::Properties,
+    wgen,
     world::{
         ChunkSource, ChunkStore, Dimension, Level,
         flat::FlatGenerator,
@@ -204,6 +205,7 @@ pub struct Server {
     pub access: Access,
     pub players: Players,
     pub game: game::Handle,
+    pub wgen: wgen::Handle,
     /// Ticks since the world's first dawn; the day time is this modulo 24000.
     pub time: AtomicI64,
     pub shutdown: Notify,
@@ -250,6 +252,7 @@ impl Server {
             access,
             players: Players::default(),
             game: game::Handle::new(),
+            wgen: wgen::Handle::default(),
             time: AtomicI64::new(6000),
             shutdown: Notify::new(),
             next_entity_id: AtomicI32::new(1),

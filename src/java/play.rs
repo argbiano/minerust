@@ -9,7 +9,7 @@ use super::{
 use crate::{
     commands::{self, Source},
     game::Input,
-    players::{Color, Event},
+    players::{Color, Event, TabEntry},
     server::{GameMode, Server},
     world::{Dimension, Level},
 };
@@ -139,6 +139,10 @@ pub async fn run(
 
     server.game.send(Input::Join { uuid: player.uuid, name: player.name.clone(), entity_id });
     let _leave = Leave(&server, player.uuid);
+    let me = server.players.get(player.uuid);
+    if let Some(me) = &me {
+        me.set_location(dimension, server.spawn);
+    }
 
     // Reading is not cancel-safe, so it runs on its own task.
     let (tx, mut rx) = mpsc::channel::<Result<RawPacket>>(64);
@@ -165,8 +169,16 @@ pub async fn run(
                     match pkt.id {
                         play::SB_KEEP_ALIVE => {
                             let id = Reader::new(&pkt.body).i64()?;
-                            if pending_keep_alive.is_some_and(|(expected, _)| expected == id) {
+                            if let Some((expected, sent_at)) = pending_keep_alive
+                                && expected == id
+                            {
                                 pending_keep_alive = None;
+                                let ms = sent_at.elapsed().as_millis().min(i32::MAX as u128) as i32;
+                                if let Some(me) = &me {
+                                    me.set_latency(ms);
+                                }
+                                let uuid = player.uuid;
+                                server.players.send_all(|| Event::TabLatency(uuid, ms));
                             }
                         }
                         play::SB_ACCEPT_TELEPORTATION => {
@@ -209,6 +221,9 @@ pub async fn run(
                             if yaw.is_some_and(|y| !y.is_finite()) {
                                 bail!("invalid rotation");
                             }
+                            if let (Some(me), Some(pos)) = (&me, pos) {
+                                me.set_location(dimension, pos);
+                            }
                             server.game.send(Input::Move { uuid: player.uuid, pos, yaw, on_ground });
                         }
                         play::SB_ATTACK => {
@@ -248,6 +263,31 @@ pub async fn run(
                         gamemode = mode;
                         out.send(play::CB_GAME_EVENT, &Writer::new().u8(3).f32(mode.java_id() as f32).buf).await?;
                         out.send(play::CB_PLAYER_ABILITIES, &abilities(mode)).await?;
+                        let uuid = player.uuid;
+                        server.players.send_all(|| Event::TabGameMode(uuid, mode));
+                    }
+                    Event::TabAdd(entries) => {
+                        out.send(play::CB_PLAYER_INFO_UPDATE, &tab_add(&entries)).await?;
+                        out.send(play::CB_TAB_LIST, &tab_header(&server)).await?;
+                    }
+                    Event::TabRemove(uuids) => {
+                        let mut w = Writer::new();
+                        w.varint(uuids.len() as i32);
+                        for uuid in uuids {
+                            w.uuid(uuid);
+                        }
+                        out.send(play::CB_PLAYER_INFO_REMOVE, &w.buf).await?;
+                        out.send(play::CB_TAB_LIST, &tab_header(&server)).await?;
+                    }
+                    Event::TabGameMode(uuid, mode) => {
+                        let mut w = Writer::new();
+                        w.u8(TAB_UPDATE_GAME_MODE).varint(1).uuid(uuid).varint(mode.java_id());
+                        out.send(play::CB_PLAYER_INFO_UPDATE, &w.buf).await?;
+                    }
+                    Event::TabLatency(uuid, ms) => {
+                        let mut w = Writer::new();
+                        w.u8(TAB_UPDATE_LATENCY).varint(1).uuid(uuid).varint(ms);
+                        out.send(play::CB_PLAYER_INFO_UPDATE, &w.buf).await?;
                     }
                     Event::Permission(level) => {
                         op_level = level;
@@ -307,6 +347,9 @@ pub async fn run(
                     }
                     Event::ChangeDimension { dimension: to, pos, yaw, death } => {
                         dimension = to;
+                        if let Some(me) = &me {
+                            me.set_location(to, pos);
+                        }
                         let mut w = Writer::new();
                         spawn_info(&mut w, &vanilla, server.level(to), gamemode);
                         // Keep attributes and entity data across portals, as vanilla does.
@@ -373,6 +416,35 @@ pub async fn run(
     reader_task.abort();
     loading.abort_all();
     result
+}
+
+// player_info_update action bits, in the order of ClientboundPlayerInfoUpdatePacket.Action.
+const TAB_ADD_PLAYER: u8 = 1 << 0;
+const TAB_UPDATE_GAME_MODE: u8 = 1 << 2;
+const TAB_UPDATE_LISTED: u8 = 1 << 3;
+const TAB_UPDATE_LATENCY: u8 = 1 << 4;
+
+fn tab_add(entries: &[TabEntry]) -> Vec<u8> {
+    let mut w = Writer::new();
+    w.u8(TAB_ADD_PLAYER | TAB_UPDATE_GAME_MODE | TAB_UPDATE_LISTED | TAB_UPDATE_LATENCY);
+    w.varint(entries.len() as i32);
+    for e in entries {
+        w.uuid(e.uuid);
+        w.string(&e.name).varint(0); // no skin properties in offline mode
+        w.varint(e.gamemode.java_id());
+        w.bool(true);
+        w.varint(e.latency);
+    }
+    w.buf
+}
+
+/// Header and footer above and below the player list.
+fn tab_header(server: &Server) -> Vec<u8> {
+    let online = server.players.count();
+    let mut w = Writer::new();
+    w.nbt_colored_text(&server.config.motd, "gold");
+    w.nbt_colored_text(&format!("{online}/{} players online", server.config.max_players), "gray");
+    w.buf
 }
 
 /// CommonPlayerSpawnInfo, shared by the login and respawn packets.

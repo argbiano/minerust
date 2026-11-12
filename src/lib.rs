@@ -8,4 +8,5 @@ pub mod players;
 pub mod prepare;
 pub mod properties;
 pub mod server;
+pub mod wgen;
 pub mod world;

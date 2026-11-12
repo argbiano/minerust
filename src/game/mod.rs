@@ -2,6 +2,7 @@
 // despawning), player health, and nether portal travel. Connections feed it `Input`s
 // and it answers through each player's event channel.
 
+pub mod liquid;
 pub mod mob;
 pub mod portal;
 
@@ -13,7 +14,7 @@ use crate::{
 use mob::{Mob, MobKind, Rng, Temper};
 use portal::{Portal, PortalKey};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     sync::{Arc, Mutex, atomic::Ordering},
     time::Duration,
 };
@@ -27,6 +28,8 @@ const TRACKING_RANGE: f64 = 64.0;
 const MAX_HEALTH: f32 = 20.0;
 const HOSTILE_CAP: usize = 15;
 const PASSIVE_CAP: usize = 8;
+/// Liquid updates per tick; the rest wait for the next one.
+const MAX_LIQUID_UPDATES: usize = 4096;
 
 pub enum Input {
     Join {
@@ -59,6 +62,11 @@ pub enum Input {
         uuid: Uuid,
     },
     SetTime(i64),
+    /// /setblock and /fill.
+    SetBlocks {
+        dimension: Dimension,
+        blocks: Vec<portal::Edit>,
+    },
     /// A destination portal finished generating.
     Arrived {
         uuid: Uuid,
@@ -116,6 +124,8 @@ struct PlayerState {
     /// Set after arriving through a portal: it must be left before it works again.
     portal_wait: bool,
     travelling: bool,
+    /// Ticks left burning after leaving lava.
+    fire: u32,
     visible: HashSet<i32>,
 }
 
@@ -152,6 +162,8 @@ struct Game {
     links: HashMap<PortalKey, PortalKey>,
     rng: Rng,
     ticks: u64,
+    liquid_queue: BTreeMap<u64, Vec<(Dimension, liquid::Pos)>>,
+    liquid_pending: HashSet<(Dimension, liquid::Pos)>,
 }
 
 impl Game {
@@ -164,6 +176,8 @@ impl Game {
             links: HashMap::new(),
             rng: Rng::new(rand::random()),
             ticks: 0,
+            liquid_queue: BTreeMap::new(),
+            liquid_pending: HashSet::new(),
         }
     }
 
@@ -205,6 +219,7 @@ impl Game {
                         portal_ticks: 0,
                         portal_wait: false,
                         travelling: false,
+                        fire: 0,
                         visible: HashSet::new(),
                     },
                 );
@@ -235,6 +250,7 @@ impl Game {
                 self.apply_edits(portal.dimension, &edits);
                 self.portals.push(portal);
             }
+            Input::SetBlocks { dimension, blocks } => self.apply_edits(dimension, &blocks),
             Input::SetTime(time) => {
                 self.server.time.store(time, Ordering::Relaxed);
                 for uuid in self.players.keys() {
@@ -305,6 +321,7 @@ impl Game {
             return;
         }
         p.dead = false;
+        p.fire = 0;
         p.health = MAX_HEALTH;
         p.dimension = Dimension::Overworld;
         p.pos = spawn;
@@ -341,15 +358,60 @@ impl Game {
         self.send(uuid, Event::ChangeDimension { dimension: portal.dimension, pos, yaw, death: false });
     }
 
-    fn apply_edits(&self, dimension: Dimension, edits: &[portal::Edit]) {
+    /// Changes blocks, tells the players who can see them, and wakes nearby liquids.
+    fn apply_edits(&mut self, dimension: Dimension, edits: &[portal::Edit]) {
         let level = self.server.level(dimension);
         for &([x, y, z], state) in edits {
             level.set_block(x, y, z, state);
         }
+        self.after_change(dimension, edits);
+    }
+
+    fn after_change(&mut self, dimension: Dimension, edits: &[portal::Edit]) {
         for (uuid, p) in &self.players {
             if p.dimension == dimension {
                 for &(pos, state) in edits {
                     self.send(*uuid, Event::BlockChanged { pos, state });
+                }
+            }
+        }
+        for &(pos, _) in edits {
+            self.wake_liquids(dimension, pos);
+        }
+    }
+
+    /// Schedules the liquid at `pos` and around it, as vanilla's neighbour updates do.
+    fn wake_liquids(&mut self, dimension: Dimension, [x, y, z]: liquid::Pos) {
+        let level = self.server.level(dimension);
+        let rules = liquid_rules(dimension);
+        for p in [[x, y, z], [x, y + 1, z], [x, y - 1, z], [x + 1, y, z], [x - 1, y, z], [x, y, z + 1], [x, y, z - 1]] {
+            let Some((fluid, _)) = level.cached_block(p[0], p[1], p[2]).and_then(liquid::fluid) else { continue };
+            if self.liquid_pending.insert((dimension, p)) {
+                self.liquid_queue.entry(self.ticks + fluid.delay(rules)).or_default().push((dimension, p));
+            }
+        }
+    }
+
+    fn tick_liquids(&mut self) {
+        let mut budget = MAX_LIQUID_UPDATES;
+        while let Some(mut entry) = self.liquid_queue.first_entry() {
+            if *entry.key() > self.ticks || budget == 0 {
+                break;
+            }
+            let due = entry.get_mut();
+            let take = due.len().min(budget);
+            let batch: Vec<_> = due.drain(..take).collect();
+            if due.is_empty() {
+                entry.remove();
+            }
+            budget -= take;
+            for (dimension, pos) in batch {
+                self.liquid_pending.remove(&(dimension, pos));
+                let mut world = LevelWorld { level: self.server.level(dimension), changes: Vec::new() };
+                liquid::tick(&mut world, pos, liquid_rules(dimension));
+                let changes = world.changes;
+                if !changes.is_empty() {
+                    self.after_change(dimension, &changes);
                 }
             }
         }
@@ -358,6 +420,7 @@ impl Game {
     fn tick(&mut self) {
         self.ticks += 1;
         let time = self.server.time.fetch_add(1, Ordering::Relaxed) + 1;
+        self.tick_liquids();
         self.tick_players();
         self.tick_mobs(time);
         if self.ticks.is_multiple_of(20) {
@@ -389,7 +452,35 @@ impl Game {
             let p = self.players.get_mut(&uuid).unwrap();
             let level = self.server.level(p.dimension);
             let (x, y, z) = (p.pos[0].floor() as i32, p.pos[1].floor() as i32, p.pos[2].floor() as i32);
-            let in_portal = [y, y + 1].iter().any(|&y| level.cached_block(x, y, z).is_some_and(blocks::is_portal));
+            let body = [y, y + 1].map(|y| level.cached_block(x, y, z));
+            let in_lava = body.iter().any(|b| b.is_some_and(blocks::is_lava));
+            let in_water = body.iter().any(|b| b.is_some_and(|b| blocks::is_liquid(b) && !blocks::is_lava(b)));
+            let burns = !matches!(gamemode, GameMode::Creative | GameMode::Spectator);
+            let was_on_fire = p.fire > 0;
+            if in_water || !burns {
+                p.fire = 0;
+            } else if in_lava {
+                // Vanilla: 15 seconds of fire after leaving lava.
+                p.fire = 300;
+            } else {
+                p.fire = p.fire.saturating_sub(1);
+            }
+            let fire = p.fire;
+            let entity_id = p.entity_id;
+            let in_portal = body.iter().any(|b| b.is_some_and(blocks::is_portal));
+            if (fire > 0) != was_on_fire {
+                self.send(uuid, Event::EntityOnFire { id: entity_id, on_fire: fire > 0 });
+            }
+            if in_lava && burns {
+                self.hurt_player(uuid, 4.0, None, "tried to swim in lava".into());
+            } else if fire > 0 && fire.is_multiple_of(20) {
+                self.hurt_player(uuid, 1.0, None, "burned to death".into());
+            }
+
+            let Some(p) = self.players.get_mut(&uuid) else { continue };
+            if p.dead {
+                continue;
+            }
             if !in_portal {
                 p.portal_ticks = 0;
                 p.portal_wait = false;
@@ -819,6 +910,32 @@ impl Game {
         for (uuid, event) in sends {
             self.send(uuid, event);
         }
+    }
+}
+
+fn liquid_rules(dimension: Dimension) -> liquid::Rules {
+    liquid::Rules { ultrawarm: dimension == Dimension::Nether }
+}
+
+/// Lets liquids read and write a level, remembering what changed.
+struct LevelWorld<'a> {
+    level: &'a Level,
+    changes: Vec<portal::Edit>,
+}
+
+impl liquid::World for LevelWorld<'_> {
+    fn get(&self, [x, y, z]: liquid::Pos) -> Option<u16> {
+        let info = self.level.info();
+        if y < info.min_y || y >= info.min_y + info.height as i32 {
+            // Outside the build height counts as unloaded, so liquids leave it alone.
+            return None;
+        }
+        self.level.cached_block(x, y, z)
+    }
+
+    fn set(&mut self, pos: liquid::Pos, state: u16) {
+        self.level.set_block(pos[0], pos[1], pos[2], state);
+        self.changes.push((pos, state));
     }
 }
 
