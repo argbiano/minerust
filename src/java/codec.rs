@@ -171,6 +171,10 @@ impl<'a> Reader<'a> {
         Ok(u16::from_be_bytes(self.bytes(2)?.try_into()?))
     }
 
+    pub fn f32(&mut self) -> Result<f32> {
+        Ok(f32::from_be_bytes(self.bytes(4)?.try_into()?))
+    }
+
     pub fn f64(&mut self) -> Result<f64> {
         Ok(f64::from_be_bytes(self.bytes(8)?.try_into()?))
     }

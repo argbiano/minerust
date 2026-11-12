@@ -2,7 +2,7 @@
 // Only commands the player may use are included, as vanilla does.
 
 use super::codec::Writer;
-use crate::commands::COMMANDS;
+use crate::{commands::COMMANDS, game::mob::MobKind};
 
 const ROOT: u8 = 0;
 const LITERAL: u8 = 1;
@@ -78,6 +78,20 @@ pub fn commands_packet(level: u8) -> Vec<u8> {
                 for sub in ["add", "remove"] {
                     let s = tree.literal(cmd, sub, false);
                     tree.arg(s, "player", Parser::Word);
+                }
+            }
+            "summon" => {
+                let cmd = tree.literal(0, "summon", false);
+                for kind in MobKind::ALL {
+                    tree.literal(cmd, kind.name(), true);
+                }
+            }
+            "time" => {
+                let cmd = tree.literal(0, "time", false);
+                tree.literal(cmd, "query", true);
+                let set = tree.literal(cmd, "set", false);
+                for value in ["day", "noon", "night", "midnight"] {
+                    tree.literal(set, value, true);
                 }
             }
             name => {

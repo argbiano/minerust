@@ -2,6 +2,7 @@ pub mod access;
 pub mod bedrock;
 pub mod commands;
 pub mod console;
+pub mod game;
 pub mod java;
 pub mod players;
 pub mod prepare;

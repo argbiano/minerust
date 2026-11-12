@@ -26,6 +26,21 @@ pub mod configuration {
 }
 
 pub mod play {
+    pub const SB_ACCEPT_TELEPORTATION: i32 = 0x00;
+    pub const SB_ATTACK: i32 = 0x01;
+    pub const SB_CLIENT_COMMAND: i32 = 0x0C;
+    pub const SB_MOVE_PLAYER_ROT: i32 = 0x20;
+    pub const SB_MOVE_PLAYER_STATUS_ONLY: i32 = 0x21;
+    pub const CB_ADD_ENTITY: i32 = 0x01;
+    pub const CB_ANIMATE: i32 = 0x02;
+    pub const CB_BLOCK_UPDATE: i32 = 0x08;
+    pub const CB_ENTITY_POSITION_SYNC: i32 = 0x23;
+    pub const CB_HURT_ANIMATION: i32 = 0x2B;
+    pub const CB_REMOVE_ENTITIES: i32 = 0x4E;
+    pub const CB_RESPAWN: i32 = 0x54;
+    pub const CB_ROTATE_HEAD: i32 = 0x55;
+    pub const CB_SET_ENTITY_DATA: i32 = 0x65;
+    pub const CB_SET_HEALTH: i32 = 0x6A;
     pub const SB_CHAT_COMMAND: i32 = 0x07;
     pub const SB_CHAT_COMMAND_SIGNED: i32 = 0x08;
     pub const SB_CHAT: i32 = 0x09;

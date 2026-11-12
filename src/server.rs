@@ -1,9 +1,10 @@
 use crate::{
     access::Access,
+    game,
     players::Players,
     properties::Properties,
     world::{
-        ChunkSource, ChunkStore,
+        ChunkSource, ChunkStore, Dimension, Level,
         flat::FlatGenerator,
         vanilla::{VanillaWorld, parse_seed},
     },
@@ -14,7 +15,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicI32, AtomicUsize},
+        atomic::{AtomicI32, AtomicI64, AtomicUsize},
     },
     time::Instant,
 };
@@ -196,11 +197,15 @@ pub fn set_property(path: &Path, key: &str, value: &str) -> Result<()> {
 
 pub struct Server {
     pub config: Config,
-    pub chunks: Arc<dyn ChunkSource>,
+    pub overworld: Level,
+    pub nether: Level,
     /// Where new players appear.
     pub spawn: [f64; 3],
     pub access: Access,
     pub players: Players,
+    pub game: game::Handle,
+    /// Ticks since the world's first dawn; the day time is this modulo 24000.
+    pub time: AtomicI64,
     pub shutdown: Notify,
     pub next_entity_id: AtomicI32,
     pub bedrock_peers: AtomicUsize,
@@ -211,34 +216,54 @@ pub struct Server {
 impl Server {
     pub async fn new(config: Config) -> Result<Self> {
         let threads = std::thread::available_parallelism().map_or(2, |n| n.get());
-        let chunks: Arc<dyn ChunkSource> = match config.level_type {
+        let (overworld, nether): (Arc<dyn ChunkSource>, Arc<dyn ChunkSource>) = match config.level_type {
             LevelType::Flat => {
                 info!("superflat world, generating chunks on {threads} threads");
-                Arc::new(ChunkStore::new(Arc::new(FlatGenerator::classic()), threads))
+                (
+                    Arc::new(ChunkStore::new(Arc::new(FlatGenerator::classic()), threads)),
+                    Arc::new(ChunkStore::new(Arc::new(FlatGenerator::nether()), threads.div_ceil(2))),
+                )
             }
             LevelType::Normal => {
-                let world = VanillaWorld::open(&config.vanilla_data, config.seed, threads).context(
+                let mut worlds = VanillaWorld::open_dimensions(
+                    &config.vanilla_data,
+                    config.seed,
+                    threads,
+                    &[Dimension::Overworld.name(), Dimension::Nether.name()],
+                )
+                .context(
                     "can't start the vanilla world generator; to use superflat instead set level-type=minecraft\\:flat in server.properties",
                 )?;
-                Arc::new(world)
+                let nether = worlds.pop().unwrap();
+                (Arc::new(worlds.pop().unwrap()), Arc::new(nether))
             }
         };
-        let spawn = chunks.spawn_point().await?;
+        let spawn = overworld.spawn_point().await?;
         info!("spawn point {:.1} {:.1} {:.1}", spawn[0], spawn[1], spawn[2]);
         let dir = config.properties_path.parent().map(Path::to_path_buf).unwrap_or_default();
         let access = Access::load(&dir, config.white_list, config.op_permission_level)?;
         Ok(Self {
             config,
-            chunks,
+            overworld: Level::new(Dimension::Overworld, overworld),
+            nether: Level::new(Dimension::Nether, nether),
             spawn,
             access,
             players: Players::default(),
+            game: game::Handle::new(),
+            time: AtomicI64::new(6000),
             shutdown: Notify::new(),
             next_entity_id: AtomicI32::new(1),
             bedrock_peers: AtomicUsize::new(0),
             session_id: Uuid::new_v4(),
             started: Instant::now(),
         })
+    }
+
+    pub fn level(&self, dimension: Dimension) -> &Level {
+        match dimension {
+            Dimension::Overworld => &self.overworld,
+            Dimension::Nether => &self.nether,
+        }
     }
 
     pub fn is_full(&self, uuid: Uuid, name: &str) -> bool {

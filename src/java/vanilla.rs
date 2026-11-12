@@ -27,6 +27,7 @@ pub struct VanillaData {
     /// The same, with full entries, for clients that answered select_known_packs differently.
     pub full_registries_and_tags: Vec<CapturedPacket>,
     pub overworld_dimension_type: i32,
+    pub nether_dimension_type: i32,
     pub overworld_clock: i32,
     /// worldgen/biome entries in registry order; a biome's network id is its index.
     pub biome_names: Vec<String>,
@@ -39,6 +40,7 @@ impl VanillaData {
         let mut select_known_packs = None;
         let mut registries_and_tags = Vec::new();
         let mut overworld_dimension_type = None;
+        let mut nether_dimension_type = None;
         let mut overworld_clock = None;
         let mut biome_names = Vec::new();
 
@@ -54,7 +56,10 @@ impl VanillaData {
                     let (registry, entries) = registry_entries(body)?;
                     let index = |name: &str| entries.iter().position(|e| e == name).map(|i| i as i32);
                     match registry.as_str() {
-                        "minecraft:dimension_type" => overworld_dimension_type = index("minecraft:overworld"),
+                        "minecraft:dimension_type" => {
+                            overworld_dimension_type = index("minecraft:overworld");
+                            nether_dimension_type = index("minecraft:the_nether");
+                        }
                         "minecraft:world_clock" => overworld_clock = index("minecraft:overworld"),
                         "minecraft:worldgen/biome" => biome_names = entries.clone(),
                         _ => {}
@@ -72,6 +77,7 @@ impl VanillaData {
             registries_and_tags,
             full_registries_and_tags: full_registries()?,
             overworld_dimension_type: overworld_dimension_type.context("no minecraft:overworld dimension type")?,
+            nether_dimension_type: nether_dimension_type.context("no minecraft:the_nether dimension type")?,
             overworld_clock: overworld_clock.context("no minecraft:overworld world clock")?,
             biome_names,
         })

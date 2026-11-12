@@ -62,11 +62,18 @@ struct Shared {
 pub struct VanillaWorld {
     info: WorldInfo,
     shared: Arc<Shared>,
-    spawn_column: [i32; 2],
+    /// Only the overworld has one.
+    spawn_column: Option<[i32; 2]>,
 }
 
 impl VanillaWorld {
+    /// The overworld only.
     pub fn open(data_dir: &Path, seed: i64, threads: usize) -> Result<Self> {
+        Ok(Self::open_dimensions(data_dir, seed, threads, &["minecraft:overworld"])?.remove(0))
+    }
+
+    /// One world per dimension of the normal preset, sharing the loaded generator data.
+    pub fn open_dimensions(data_dir: &Path, seed: i64, threads: usize, dimensions: &[&str]) -> Result<Vec<Self>> {
         crate::prepare::check(data_dir)?;
         let facts = std::fs::read(data_dir.join("facts.json")).context("reading facts.json")?;
         let registry: &'static BlockRegistry =
@@ -76,15 +83,23 @@ impl VanillaWorld {
         for warning in data.warnings() {
             debug!("worldgen data: {warning}");
         }
-        let generator =
-            OverworldGenerator::for_world(data.clone(), seed, "minecraft:normal", "minecraft:overworld", true)
-                .map_err(|e| anyhow!("setting up the world generator: {e}"))?;
+        dimensions.iter().map(|dimension| Self::start(data.clone(), seed, threads, dimension)).collect()
+    }
+
+    fn start(data: Arc<GeneratorData>, seed: i64, threads: usize, dimension: &str) -> Result<Self> {
+        let generator = OverworldGenerator::for_world(data.clone(), seed, "minecraft:normal", dimension, true)
+            .map_err(|e| anyhow!("setting up the {dimension} generator: {e}"))?;
         for (feature, kind) in generator.unsupported_features() {
             warn!("feature {feature} ({kind}) isn't supported by the generator and will be skipped");
         }
 
         let (min_y, height) = generator.level();
-        let spawn_column = generator.spawn_position().map_err(|e| anyhow!("finding the spawn point: {e}"))?;
+        let spawn_column = if dimension == "minecraft:overworld" {
+            Some(generator.spawn_position().map_err(|e| anyhow!("finding the spawn point: {e}"))?)
+        } else {
+            None
+        };
+        let short = dimension.trim_start_matches("minecraft:").to_owned();
         let info = WorldInfo {
             min_y,
             height: height as u32,
@@ -100,11 +115,11 @@ impl VanillaWorld {
             let queue: Receiver<Job> = queue.clone();
             let shared = shared.clone();
             thread::Builder::new()
-                .name(format!("worldgen-{i}"))
+                .name(format!("worldgen-{short}-{i}"))
                 .spawn(move || run_worker(worker, queue, shared))
                 .context("spawning a worldgen thread")?;
         }
-        info!("vanilla world generator ready (seed {seed}, {threads} threads)");
+        info!("vanilla {short} generator ready (seed {seed}, {threads} threads)");
         Ok(Self { info, shared, spawn_column })
     }
 }
@@ -129,8 +144,12 @@ impl ChunkSource for VanillaWorld {
         &self.info
     }
 
+    fn cached(&self, x: i32, z: i32) -> Option<Arc<Chunk>> {
+        self.shared.state.lock().unwrap().finished.get(&(x, z)).cloned()
+    }
+
     async fn spawn_point(&self) -> Result<[f64; 3]> {
-        let [x, z] = self.spawn_column;
+        let [x, z] = self.spawn_column.context("this dimension has no spawn point")?;
         let chunk = self.get(x >> 4, z >> 4).await?;
         let y = chunk.surface((x & 15) as usize, (z & 15) as usize);
         Ok([x as f64 + 0.5, y as f64, z as f64 + 0.5])
