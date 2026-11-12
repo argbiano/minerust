@@ -16,10 +16,15 @@ use std::{sync::Arc, time::Duration};
 pub mod blocks {
     pub const AIR: u16 = 0;
     pub const STONE: u16 = 1;
+    pub const COBBLESTONE: u16 = 14;
+    pub const OAK_PLANKS: u16 = 15;
+    pub const SAND: u16 = 121;
+    pub const GLASS: u16 = 661;
     pub const GRASS_BLOCK: u16 = 9;
     pub const DIRT: u16 = 10;
     pub const BEDROCK: u16 = 88;
     pub const WATER: u16 = 89;
+    pub const LAVA: u16 = 105;
     pub const OBSIDIAN: u16 = 4925;
     pub const NETHERRACK: u16 = 8667;
     pub const NETHER_PORTAL_X: u16 = 8687;
@@ -46,7 +51,16 @@ pub mod blocks {
 
     /// Whether a mob stands on or bumps into the block.
     pub fn is_solid(state: u16) -> bool {
-        super::passable::PASSABLE
+        !in_ranges(super::passable::PASSABLE, state)
+    }
+
+    /// Whether flowing water or lava may wash the block away and take its place.
+    pub fn is_fluid_replaceable(state: u16) -> bool {
+        in_ranges(super::passable::FLUID_REPLACEABLE, state)
+    }
+
+    fn in_ranges(ranges: &[(u16, u16)], state: u16) -> bool {
+        ranges
             .binary_search_by(|&(lo, hi)| {
                 if hi < state {
                     std::cmp::Ordering::Less
@@ -56,7 +70,7 @@ pub mod blocks {
                     std::cmp::Ordering::Equal
                 }
             })
-            .is_err()
+            .is_ok()
     }
 }
 

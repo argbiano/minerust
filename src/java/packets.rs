@@ -41,6 +41,9 @@ pub mod play {
     pub const CB_ROTATE_HEAD: i32 = 0x55;
     pub const CB_SET_ENTITY_DATA: i32 = 0x65;
     pub const CB_SET_HEALTH: i32 = 0x6A;
+    pub const CB_PLAYER_INFO_REMOVE: i32 = 0x46;
+    pub const CB_PLAYER_INFO_UPDATE: i32 = 0x47;
+    pub const CB_TAB_LIST: i32 = 0x7D;
     pub const SB_CHAT_COMMAND: i32 = 0x07;
     pub const SB_CHAT_COMMAND_SIGNED: i32 = 0x08;
     pub const SB_CHAT: i32 = 0x09;

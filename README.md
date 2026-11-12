@@ -33,6 +33,16 @@ Where things stand:
   damage, regenerate slowly, die, and respawn. `/summon <mob>` and `/time set|query` help testing.
   The world clock now advances on the server. Mobs walk on block-level physics without
   pathfinding, and since there is no lighting engine, "dark" means night.
+- **Liquids:** water and lava flow like vanilla's: a level weaker per block (lava two per block
+  in the overworld, one in the nether), falling straight down, heading for the nearest drop,
+  washing away plants and torches, drying up when their source goes, and two water sources make
+  a third. Lava touching water hardens to obsidian (source) or cobblestone, and lava falling onto
+  water makes stone. Water updates every 5 ticks, lava every 30 (10 in the nether). Players in
+  lava take damage and keep burning for 15 seconds unless they reach water. Players can't place
+  blocks yet, so `/setblock <x> <y> <z> <block>` and `/fill` (both accept `~` coordinates) start
+  things flowing.
+- **Tab list:** everyone online with their game mode and ping, updated as players join, leave or
+  change mode, under the MOTD and an online count.
 - **Bedrock:** NetherNet signaling with a signed server identity, WebRTC data channels, and the
   `RequestNetworkSettings` → `NetworkSettings` handshake. Logging in isn't implemented yet, so
   Bedrock players get a disconnect message right after the handshake.
@@ -92,7 +102,8 @@ range of UDP ports, that isn't supported yet.
   decoration of 3×3 regions that never overlap while running, and a chunk is finished once all
   8 neighbours are decorated. `level.rs` keeps a dimension's block edits (portals) on top of them.
 - `src/game/` – the 20 tick-per-second simulation: world time, player health, mob spawning, AI
-  and combat (`mob.rs`), and nether portals (`portal.rs`). Connections send it inputs and get
+  and combat (`mob.rs`), nether portals (`portal.rs`) and flowing liquids (`liquid.rs`).
+  Connections send it inputs and get
   events back, so it doesn't depend on either protocol.
 - `src/prepare/` – `minerust prepare`
 - `src/java/` – Java Edition: framing, login/configuration/play, chunk encoding, vanilla registry data

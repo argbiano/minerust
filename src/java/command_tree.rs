@@ -94,6 +94,10 @@ pub fn commands_packet(level: u8) -> Vec<u8> {
                     tree.literal(set, value, true);
                 }
             }
+            "setblock" | "fill" => {
+                let cmd = tree.literal(0, spec.name, false);
+                tree.arg(cmd, "args", Parser::Greedy);
+            }
             "wgen" => {
                 let cmd = tree.literal(0, "wgen", false);
                 tree.literal(cmd, "stop", true);
