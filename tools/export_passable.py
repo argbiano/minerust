@@ -2,9 +2,11 @@
 
 Usage: python3 tools/export_passable.py generated/reports/blocks.json > src/world/passable.rs
 
-Both tables are name heuristics, not vanilla's collision shapes or fluid rules:
+All tables are name heuristics, not vanilla's collision shapes, light levels or fluid rules:
 - PASSABLE: blocks without a collision box that mobs walk through (plants, liquids,
   torches, rails...).
+- LIGHT_SOURCES: blocks that give off light in some state (torches, lava, glowstone, lamps...),
+  standing in for a lighting engine when deciding where monsters may spawn.
 - FLUID_REPLACEABLE: blocks that flowing water or lava washes away (air, plants, torches,
   rails, redstone dust, fire, snow layers).
 """
@@ -40,6 +42,17 @@ FLUID_REPLACEABLE = re.compile(
 )
 
 
+LIGHT_SOURCES = re.compile(
+    r"^minecraft:("
+    r".*torch|.*lantern|glowstone|shroomlight|.*froglight|lava|fire|soul_fire|.*campfire|end_rod|beacon|conduit"
+    r"|magma_block|glow_lichen|sea_pickle|crying_obsidian|respawn_anchor|.*candle|.*candle_cake|redstone_lamp"
+    r"|cave_vines(_plant)?|amethyst_cluster|large_amethyst_bud|brewing_stand|.*furnace|smoker|redstone_ore"
+    r"|deepslate_redstone_ore|end_portal|end_gateway|nether_portal|copper_bulb|.*_copper_bulb|light|creaking_heart"
+    r"|sculk_catalyst|firefly_bush|trial_spawner|vault|enchanting_table|ender_chest|dragon_egg"
+    r")$"
+)
+
+
 def ranges_of(blocks, pattern):
     ids = sorted(s["id"] for name, b in blocks.items() if pattern.match(name) for s in b["states"])
     ranges = []
@@ -67,6 +80,8 @@ def main():
     table("PASSABLE", "Blocks without a collision box.", ranges_of(blocks, PASSABLE))
     print()
     table("FLUID_REPLACEABLE", "Blocks flowing water and lava wash away.", ranges_of(blocks, FLUID_REPLACEABLE))
+    print()
+    table("LIGHT_SOURCES", "Blocks that give off light in at least one of their states.", ranges_of(blocks, LIGHT_SOURCES))
 
 
 main()

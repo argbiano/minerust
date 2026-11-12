@@ -30,6 +30,8 @@ use uuid::Uuid;
 
 const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(10);
 const KEEP_ALIVE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Chunk requests a connection keeps open at once.
+const MAX_CHUNKS_IN_FLIGHT: usize = 64;
 
 type Encoded = ((Dimension, i32, i32), Vec<u8>);
 
@@ -118,12 +120,18 @@ pub async fn run(
 
     let mut view = ChunkView::new(cfg.view_distance);
     let mut loading: JoinSet<Result<Encoded>> = JoinSet::new();
-    let request = |loading: &mut JoinSet<Result<Encoded>>, dimension: Dimension, chunks: Vec<(i32, i32)>| {
+    // Chunks the player should get but that aren't requested yet, farthest first so `pop`
+    // gives the nearest. Asking for a few at a time keeps the chunks around the player
+    // first in the generator's queue, whatever the view distance.
+    let mut queue: Vec<(i32, i32)> = Vec::new();
+    let pump = |loading: &mut JoinSet<Result<Encoded>>, queue: &mut Vec<(i32, i32)>, dimension: Dimension| {
         let biome_ids = match dimension {
             Dimension::Overworld => overworld_biomes.clone(),
             Dimension::Nether => nether_biomes.clone(),
         };
-        for (x, z) in chunks {
+        while loading.len() < MAX_CHUNKS_IN_FLIGHT
+            && let Some((x, z)) = queue.pop()
+        {
             let server = server.clone();
             let biome_ids = biome_ids.clone();
             loading.spawn(async move {
@@ -132,10 +140,19 @@ pub async fn run(
             });
         }
     };
+    let enqueue = |queue: &mut Vec<(i32, i32)>, view: &ChunkView, load: Vec<(i32, i32)>| {
+        queue.retain(|c| view.contains(*c));
+        queue.extend(load);
+        if let Some((cx, cz)) = view.center() {
+            queue.sort_by_key(|(x, z)| std::cmp::Reverse((x - cx).pow(2) + (z - cz).pow(2)));
+        }
+    };
 
     let center = chunk_of(sx, sz);
     out.send(play::CB_SET_CHUNK_CACHE_CENTER, &Writer::new().varint(center.0).varint(center.1).buf).await?;
-    request(&mut loading, dimension, view.move_to(center).load);
+    let load = view.move_to(center).load;
+    enqueue(&mut queue, &view, load);
+    pump(&mut loading, &mut queue, dimension);
 
     server.game.send(Input::Join { uuid: player.uuid, name: player.name.clone(), entity_id });
     let _leave = Leave(&server, player.uuid);
@@ -215,7 +232,8 @@ pub async fn run(
                                     for (fx, fz) in change.forget {
                                         out.send(play::CB_FORGET_LEVEL_CHUNK, &Writer::new().i64(pack_chunk(fx, fz)).buf).await?;
                                     }
-                                    request(&mut loading, dimension, change.load);
+                                    enqueue(&mut queue, &view, change.load);
+                                    pump(&mut loading, &mut queue, dimension);
                                 }
                             }
                             if yaw.is_some_and(|y| !y.is_finite()) {
@@ -298,21 +316,21 @@ pub async fn run(
                         out.send(play::CB_DISCONNECT, &Writer::new().nbt_text(&reason).buf).await.ok();
                         bail!("kicked: {reason}");
                     }
-                    Event::SpawnMob { id, uuid, type_id, pos, yaw } => {
+                    Event::SpawnMob { id, uuid, type_id, pos, yaw, head_yaw, pitch } => {
                         let mut w = Writer::new();
                         w.varint(id).uuid(uuid).varint(type_id).f64(pos[0]).f64(pos[1]).f64(pos[2]);
                         w.u8(0); // velocity: LpVec3's single zero byte
-                        w.u8(0).u8(angle(yaw)).u8(angle(yaw)); // pitch, yaw, head yaw
+                        w.u8(angle(pitch)).u8(angle(yaw)).u8(angle(head_yaw));
                         w.varint(0); // data
                         out.send(play::CB_ADD_ENTITY, &w.buf).await?;
                     }
-                    Event::MoveEntity { id, pos, yaw, on_ground } => {
+                    Event::MoveEntity { id, pos, yaw, head_yaw, pitch, on_ground } => {
                         let mut w = Writer::new();
                         w.varint(id).varint(0); // PositionPath type 0: linear
                         w.f64(pos[0]).f64(pos[1]).f64(pos[2]);
-                        w.f32(yaw).f32(0.0).bool(on_ground);
+                        w.f32(yaw).f32(pitch).bool(on_ground);
                         out.send(play::CB_ENTITY_POSITION_SYNC, &w.buf).await?;
-                        out.send(play::CB_ROTATE_HEAD, &Writer::new().varint(id).u8(angle(yaw)).buf).await?;
+                        out.send(play::CB_ROTATE_HEAD, &Writer::new().varint(id).u8(angle(head_yaw)).buf).await?;
                     }
                     Event::RemoveEntities(ids) => {
                         let mut w = Writer::new();
@@ -368,7 +386,10 @@ pub async fn run(
                         teleport_id += 1;
                         out.send(play::CB_PLAYER_POSITION, &teleport(teleport_id, pos, yaw)).await?;
                         awaiting_teleport = Some(teleport_id);
-                        request(&mut loading, dimension, view.move_to(center).load);
+                        queue.clear();
+                        let load = view.move_to(center).load;
+                        enqueue(&mut queue, &view, load);
+                        pump(&mut loading, &mut queue, dimension);
                     }
                     Event::Time(ticks) => {
                         out.send(play::CB_SET_TIME, &set_time(&vanilla, ticks)).await?;
@@ -396,6 +417,7 @@ pub async fn run(
                         }
                         out.send(play::CB_CHUNK_BATCH_FINISHED, &Writer::new().varint(batch.len() as i32).buf).await?;
                     }
+                    pump(&mut loading, &mut queue, dimension);
                 }
                 _ = ticker.tick() => {
                     if let Some((_, sent_at)) = pending_keep_alive {

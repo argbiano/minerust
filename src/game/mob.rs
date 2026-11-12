@@ -1,5 +1,6 @@
 // Mob kinds, their stats, and the block-level movement every mob shares.
 
+use super::path;
 use crate::world::{Dimension, blocks};
 use uuid::Uuid;
 
@@ -129,6 +130,23 @@ impl MobKind {
     pub fn burns_in_daylight(self) -> bool {
         matches!(self, Self::Zombie | Self::Skeleton)
     }
+
+    /// Hitbox height, from vanilla's entity dimensions.
+    pub fn height(self) -> f64 {
+        match self {
+            Self::Zombie | Self::ZombifiedPiglin => 1.95,
+            Self::Skeleton => 1.99,
+            Self::Creeper => 1.7,
+            Self::Spider | Self::Pig => 0.9,
+            Self::Cow => 1.4,
+            Self::Sheep => 1.3,
+            Self::Chicken => 0.7,
+        }
+    }
+
+    pub fn eye_height(self) -> f64 {
+        self.height() * 0.85
+    }
 }
 
 pub struct Mob {
@@ -137,9 +155,12 @@ pub struct Mob {
     pub kind: MobKind,
     pub dimension: Dimension,
     pub pos: [f64; 3],
-    /// Knockback and falling; walking is added on top each tick.
+    /// Knockback, jumping and falling; walking is added on top each tick.
     pub vel: [f64; 3],
+    /// Body rotation.
     pub yaw: f32,
+    pub head_yaw: f32,
+    pub pitch: f32,
     pub on_ground: bool,
     pub health: f32,
     /// Ticks of damage immunity left after being hurt.
@@ -153,8 +174,16 @@ pub struct Mob {
     /// Ticks a passive mob keeps fleeing from `panic_from`.
     pub panic: u32,
     pub panic_from: [f64; 3],
-    pub wander: Option<[f64; 2]>,
-    pub wander_ticks: u32,
+    /// Blocks still to walk through, nearest first.
+    pub path: Vec<path::Node>,
+    /// Where `path` leads, so it isn't searched again while that holds.
+    pub path_goal: Option<path::Node>,
+    /// Ticks before the path may be searched again.
+    pub repath: u32,
+    /// Ticks spent on the path without getting nearer to its next block.
+    pub stuck: u32,
+    pub stuck_best: f64,
+    pub look: Option<(Look, u32)>,
     pub fuse: u32,
     pub fire: u32,
     pub age: u32,
@@ -163,7 +192,16 @@ pub struct Mob {
     /// What viewers were last told.
     pub sent_pos: [f64; 3],
     pub sent_yaw: f32,
+    pub sent_head_yaw: f32,
+    pub sent_pitch: f32,
     pub sent_on_fire: bool,
+}
+
+/// What a mob's head turns to when it isn't busy.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Look {
+    Player(Uuid),
+    Direction(f32),
 }
 
 impl Mob {
@@ -176,6 +214,8 @@ impl Mob {
             pos,
             vel: [0.0; 3],
             yaw,
+            head_yaw: yaw,
+            pitch: 0.0,
             on_ground: false,
             health: kind.max_health(),
             hurt_time: 0,
@@ -185,14 +225,20 @@ impl Mob {
             anger: 0,
             panic: 0,
             panic_from: pos,
-            wander: None,
-            wander_ticks: 0,
+            path: Vec::new(),
+            path_goal: None,
+            repath: 0,
+            stuck: 0,
+            stuck_best: f64::INFINITY,
+            look: None,
             fuse: 0,
             fire: 0,
             age: 0,
             persistent: false,
             sent_pos: pos,
             sent_yaw: yaw,
+            sent_head_yaw: yaw,
+            sent_pitch: 0.0,
             sent_on_fire: false,
         }
     }
@@ -201,15 +247,79 @@ impl Mob {
         self.death_time.is_none()
     }
 
-    pub fn face(&mut self, dx: f64, dz: f64) {
-        if dx.abs() > 1e-6 || dz.abs() > 1e-6 {
-            self.yaw = yaw_towards(dx, dz);
-        }
+    /// The block the mob's feet are in.
+    pub fn block_pos(&self) -> path::Node {
+        [self.pos[0].floor() as i32, (self.pos[1] + 1e-6).floor() as i32, self.pos[2].floor() as i32]
     }
 
-    /// One tick of movement: `walk` is the horizontal step the AI wants. Returns
-    /// false when the step was blocked. `block` answers `None` for unloaded blocks,
-    /// which count as solid so mobs don't wander into missing chunks.
+    pub fn clear_path(&mut self) {
+        self.path.clear();
+        self.path_goal = None;
+        self.stuck = 0;
+        self.stuck_best = f64::INFINITY;
+    }
+
+    /// The horizontal step towards the next block of the path, dropping blocks already
+    /// reached and the path itself when the mob stops making progress on it.
+    pub fn follow_path(&mut self, speed: f64) -> [f64; 2] {
+        while let Some(&[x, y, z]) = self.path.first() {
+            let (dx, dz) = (x as f64 + 0.5 - self.pos[0], z as f64 + 0.5 - self.pos[2]);
+            let close = dx * dx + dz * dz < 0.35 * 0.35;
+            // A step up counts once the mob is up there; a drop as soon as it is above it.
+            if close && (self.pos[1] - y as f64).abs() < 1.2 {
+                self.path.remove(0);
+                self.stuck = 0;
+                self.stuck_best = f64::INFINITY;
+                continue;
+            }
+            let distance = (dx * dx + dz * dz).sqrt();
+            if distance < self.stuck_best - 0.05 {
+                self.stuck_best = distance;
+                self.stuck = 0;
+            } else {
+                self.stuck += 1;
+                if self.stuck > 40 {
+                    self.clear_path();
+                    return [0.0, 0.0];
+                }
+            }
+            // Slow down for the last block so it doesn't overshoot and turn around.
+            let step = speed.min(distance);
+            return [dx / distance * step, dz / distance * step];
+        }
+        self.path_goal = None;
+        [0.0, 0.0]
+    }
+
+    /// Turns the body towards where it walks (or its head when standing) and the head
+    /// towards `look`, a little each tick as vanilla's body and look controls do.
+    pub fn turn(&mut self, walk: [f64; 2], look_at: Option<[f64; 3]>) {
+        let moving = walk[0].abs() > 1e-3 || walk[1].abs() > 1e-3;
+        if moving {
+            self.yaw = approach(self.yaw, yaw_towards(walk[0], walk[1]), 30.0);
+        }
+        let (head, pitch) = match look_at {
+            Some(at) => {
+                let eye = [self.pos[0], self.pos[1] + self.kind.eye_height(), self.pos[2]];
+                let (dx, dy, dz) = (at[0] - eye[0], at[1] - eye[1], at[2] - eye[2]);
+                let flat = (dx * dx + dz * dz).sqrt();
+                (yaw_towards(dx, dz), (-dy.atan2(flat).to_degrees()) as f32)
+            }
+            None => (self.yaw, 0.0),
+        };
+        self.head_yaw = approach(self.head_yaw, head, 40.0);
+        // Heads turn at most 75° from the body; past that the body follows.
+        let off = wrap(self.head_yaw - self.yaw);
+        if off.abs() > 75.0 {
+            self.yaw = wrap(self.head_yaw - 75.0 * off.signum());
+        }
+        self.pitch = approach(self.pitch, pitch.clamp(-40.0, 40.0), 20.0);
+    }
+
+    /// One tick of movement: `walk` is the horizontal step the AI wants. Returns false
+    /// when the mob is standing against something it can neither walk nor jump over.
+    /// `block` answers `None` for unloaded blocks, which count as solid so mobs don't
+    /// wander into missing chunks.
     pub fn step(&mut self, walk: [f64; 2], cautious: bool, block: &impl Fn(i32, i32, i32) -> Option<u16>) -> bool {
         let solid = |x: i32, y: i32, z: i32| block(x, y, z).is_none_or(blocks::is_solid);
         let liquid = |x: i32, y: i32, z: i32| block(x, y, z).is_some_and(blocks::is_liquid);
@@ -221,10 +331,15 @@ impl Mob {
         let mut blocked = false;
         if dx.abs() > 1e-4 || dz.abs() > 1e-4 {
             // Slide along walls: try the full step, then each axis on its own.
-            let moved = self.try_move(dx, dz, cautious, &solid, &liquid)
-                || self.try_move(dx, 0.0, cautious, &solid, &liquid)
-                || self.try_move(0.0, dz, cautious, &solid, &liquid);
-            blocked = !moved;
+            let mut result = self.try_move(dx, dz, cautious, &solid, &liquid);
+            if result == Move::Blocked {
+                result = self.try_move(dx, 0.0, cautious, &solid, &liquid);
+            }
+            if result == Move::Blocked {
+                result = self.try_move(0.0, dz, cautious, &solid, &liquid);
+            }
+            // Mid-jump the mob is still on its way up, not stuck.
+            blocked = result == Move::Blocked && self.on_ground;
         }
 
         let fx = self.pos[0].floor() as i32;
@@ -237,28 +352,36 @@ impl Mob {
                 solid(bx, y, bz) && !liquid(bx, y, bz)
             })
         };
-        if liquid(fx, (self.pos[1] + 0.5).floor() as i32, fz) {
+        let in_liquid = liquid(fx, (self.pos[1] + 0.5).floor() as i32, fz);
+        if in_liquid {
             // Swim upwards, as vanilla mobs do.
             self.vel[1] = 0.06;
-        } else {
-            self.vel[1] = (self.vel[1] - 0.08) * 0.98;
         }
         let ny = self.pos[1] + self.vel[1];
         if self.vel[1] <= 0.0 {
-            let below = ny.floor() as i32;
-            if under(below) {
-                self.pos[1] = (below + 1) as f64;
-                self.vel[1] = 0.0;
-                self.on_ground = true;
-            } else {
-                self.pos[1] = ny;
-                self.on_ground = false;
+            // The first floor between here and where the fall ends, so fast falls can't skip one.
+            let from = (self.pos[1] - 1e-6).floor() as i32;
+            let to = (ny - 1e-6).floor() as i32;
+            match (to..=from).rev().find(|&y| under(y)) {
+                Some(floor) => {
+                    self.pos[1] = (floor + 1) as f64;
+                    self.vel[1] = 0.0;
+                    self.on_ground = true;
+                }
+                None => {
+                    self.pos[1] = ny;
+                    self.on_ground = false;
+                }
             }
-        } else if solid(fx, (ny + 1.8).floor() as i32, fz) {
+        } else if solid(fx, (ny + self.kind.height()).floor() as i32, fz) {
             self.vel[1] = 0.0;
         } else {
             self.pos[1] = ny;
             self.on_ground = false;
+        }
+        // Gravity after moving, as vanilla applies it, so a 0.42 jump clears a block.
+        if !in_liquid && !self.on_ground {
+            self.vel[1] = (self.vel[1] - 0.08) * 0.98;
         }
         !blocked
     }
@@ -270,36 +393,56 @@ impl Mob {
         cautious: bool,
         solid: &impl Fn(i32, i32, i32) -> bool,
         liquid: &impl Fn(i32, i32, i32) -> bool,
-    ) -> bool {
+    ) -> Move {
         if dx == 0.0 && dz == 0.0 {
-            return false;
+            return Move::Blocked;
         }
         let (nx, nz) = (self.pos[0] + dx, self.pos[2] + dz);
         // The leading edge of a body about 0.6 blocks wide.
         let bx = (nx + 0.3 * dx.signum()).floor() as i32;
         let bz = (nz + 0.3 * dz.signum()).floor() as i32;
         let fy = (self.pos[1] + 1e-6).floor() as i32;
+        let (cx, cz) = (self.pos[0].floor() as i32, self.pos[2].floor() as i32);
 
-        let mut y = self.pos[1];
         if solid(bx, fy, bz) {
-            if !self.on_ground || solid(bx, fy + 1, bz) || solid(bx, fy + 2, bz) {
-                return false;
+            // A one-block step: jump it, with the vanilla jump speed, and walk on once high enough.
+            if self.on_ground && !solid(bx, fy + 1, bz) && !solid(bx, fy + 2, bz) && !solid(cx, fy + 2, cz) {
+                self.vel[1] = 0.42;
+                self.on_ground = false;
+                return Move::Jumping;
             }
-            y = (fy + 1) as f64; // step (jump) up one block
-        } else if solid(bx, fy + 1, bz) {
-            return false;
+            return Move::Blocked;
+        }
+        if solid(bx, fy + 1, bz) {
+            return Move::Blocked;
         }
         if cautious {
-            let ground = y.floor() as i32;
-            let drop = (1..=4).all(|d| !solid(bx, ground - d, bz));
-            let wet = liquid(bx, ground, bz) || liquid(bx, ground - 1, bz);
+            let drop = (1..=4).all(|d| !solid(bx, fy - d, bz));
+            let wet = liquid(bx, fy, bz) || liquid(bx, fy - 1, bz);
             if drop || wet {
-                return false;
+                return Move::Blocked;
             }
         }
-        self.pos = [nx, y, nz];
-        true
+        self.pos = [nx, self.pos[1], nz];
+        Move::Moved
     }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Move {
+    Moved,
+    Jumping,
+    Blocked,
+}
+
+/// `from` turned towards `to` by at most `max` degrees, the short way round.
+pub fn approach(from: f32, to: f32, max: f32) -> f32 {
+    wrap(from + wrap(to - from).clamp(-max, max))
+}
+
+/// Degrees in -180..180.
+pub fn wrap(degrees: f32) -> f32 {
+    (degrees + 180.0).rem_euclid(360.0) - 180.0
 }
 
 /// Minecraft yaw (0 = +z, 90 = -x) of a horizontal direction.
@@ -365,14 +508,36 @@ mod tests {
         assert_eq!(mob.pos[1], 64.0, "fell onto the ground");
         assert!(mob.on_ground);
 
-        for _ in 0..30 {
+        let mut peak: f64 = 0.0;
+        for _ in 0..40 {
             mob.step([0.1, 0.0], true, &terrain);
+            peak = peak.max(mob.pos[1]);
         }
         assert_eq!(mob.pos[1], 65.0, "stepped up one block");
+        assert!(peak > 65.0 && peak < 65.5, "by jumping, not teleporting: peak {peak}");
         for _ in 0..40 {
             mob.step([0.1, 0.0], true, &terrain);
         }
         assert!(mob.pos[0] < 6.0, "a two-block wall stops it, at {:?}", mob.pos);
+        assert!(!mob.step([0.1, 0.0], true, &terrain), "and reports being blocked");
+    }
+
+    #[test]
+    fn turns_gradually_and_heads_lead_the_body() {
+        let mut mob = Mob::new(1, MobKind::Cow, Dimension::Overworld, [0.5, 64.0, 0.5], 0.0);
+        mob.turn([-0.1, 0.0], None); // walk west: yaw 90
+        assert_eq!(mob.yaw, 30.0);
+        for _ in 0..5 {
+            mob.turn([-0.1, 0.0], None);
+        }
+        assert_eq!(mob.yaw, 90.0);
+        // Look back east while standing still: the head turns, the body follows past 75°.
+        for _ in 0..10 {
+            mob.turn([0.0, 0.0], Some([10.0, 65.3, 0.5]));
+        }
+        assert!((wrap(mob.head_yaw) - -90.0).abs() < 0.01, "head {}", mob.head_yaw);
+        assert!(wrap(mob.head_yaw - mob.yaw).abs() <= 75.01);
+        assert_eq!(approach(170.0, -170.0, 30.0), -170.0, "turns the short way round");
     }
 
     #[test]

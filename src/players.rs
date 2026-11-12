@@ -51,7 +51,7 @@ impl Color {
 }
 
 /// Things the server asks a connection to do.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub enum Event {
     Message(String, Color),
     GameMode(GameMode),
@@ -65,11 +65,16 @@ pub enum Event {
         type_id: i32,
         pos: [f64; 3],
         yaw: f32,
+        head_yaw: f32,
+        pitch: f32,
     },
     MoveEntity {
         id: i32,
         pos: [f64; 3],
+        /// Body, head and pitch, in degrees.
         yaw: f32,
+        head_yaw: f32,
+        pitch: f32,
         on_ground: bool,
     },
     RemoveEntities(Vec<i32>),
