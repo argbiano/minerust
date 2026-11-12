@@ -59,6 +59,16 @@ pub mod blocks {
         in_ranges(super::passable::FLUID_REPLACEABLE, state)
     }
 
+    /// Whether the block may give off light (any of its states does, lit or not).
+    pub fn is_light_source(state: u16) -> bool {
+        in_ranges(super::passable::LIGHT_SOURCES, state)
+    }
+
+    /// Grass block, snowy or not: where animals spawn.
+    pub fn is_grass_block(state: u16) -> bool {
+        matches!(state, 8 | GRASS_BLOCK)
+    }
+
     fn in_ranges(ranges: &[(u16, u16)], state: u16) -> bool {
         ranges
             .binary_search_by(|&(lo, hi)| {

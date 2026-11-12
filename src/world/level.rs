@@ -61,6 +61,11 @@ impl Level {
         Ok(self.with_edits(chunk))
     }
 
+    /// The chunk as players see it if it is generated, without waiting.
+    pub fn cached_chunk(&self, x: i32, z: i32) -> Option<Arc<Chunk>> {
+        Some(self.with_edits(self.source.cached(x, z)?))
+    }
+
     /// The block if its chunk is generated, without waiting.
     pub fn cached_block(&self, x: i32, y: i32, z: i32) -> Option<u16> {
         let key = (x >> 4, z >> 4);

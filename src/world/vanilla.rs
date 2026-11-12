@@ -134,7 +134,7 @@ impl ChunkSource for VanillaWorld {
             }
             let (tx, rx) = oneshot::channel();
             state.waiting.entry((x, z)).or_default().push(tx);
-            schedule(&mut state, &self.shared.jobs);
+            schedule(&mut state, &self.shared.jobs, (x, z), 0);
             rx
         };
         rx.await.map_err(|_| anyhow!("world generator dropped chunk {x} {z}"))?.map_err(|e| anyhow!(e))
@@ -160,9 +160,11 @@ fn around(c: Pos, r: i32) -> impl Iterator<Item = Pos> {
     (-r..=r).flat_map(move |dz| (-r..=r).map(move |dx| (c.0 + dx, c.1 + dz)))
 }
 
-/// Starts whatever work the waiting chunks can use next.
-fn schedule(state: &mut State, jobs: &Sender<Job>) {
-    let wanted: Vec<Pos> = state.waiting.keys().copied().collect();
+/// Starts whatever work the waiting chunks within `radius` of `center` can use next. Each
+/// finished job only unblocks chunks within 3 of it, so callers pass that instead of
+/// rescanning every waiting chunk, which got quadratic at large view distances.
+fn schedule(state: &mut State, jobs: &Sender<Job>, center: Pos, radius: i32) {
+    let wanted: Vec<Pos> = around(center, radius).filter(|c| state.waiting.contains_key(c)).collect();
     for c in wanted {
         if let Some(error) = around(c, 2).find_map(|p| state.slots.get(&p).and_then(|s| s.failed.clone())) {
             fail(state, c, &error);
@@ -221,7 +223,7 @@ fn run_worker(mut worker: GeneratorWorker, queue: Receiver<Job>, shared: Arc<Sha
                         slot.failed = Some(e);
                     }
                 }
-                schedule(&mut state, &shared.jobs);
+                schedule(&mut state, &shared.jobs, pos, 3);
             }
             Job::Decorate(pos, region) => {
                 let mut array: [ProtoChunk; 9] = match region.into_iter().map(|b| *b).collect::<Vec<_>>().try_into() {
@@ -240,7 +242,7 @@ fn run_worker(mut worker: GeneratorWorker, queue: Receiver<Job>, shared: Arc<Sha
                 let slot = state.slots.get_mut(&pos).unwrap();
                 slot.decorating = false;
                 slot.decorated = true;
-                schedule(&mut state, &shared.jobs);
+                schedule(&mut state, &shared.jobs, pos, 3);
             }
             Job::Finish(pos, proto) => {
                 let chunk = Arc::new(to_chunk(&proto, pos, shared.min_y, shared.height));
@@ -253,7 +255,7 @@ fn run_worker(mut worker: GeneratorWorker, queue: Receiver<Job>, shared: Arc<Sha
                 for waiter in state.waiting.remove(&pos).unwrap_or_default() {
                     let _ = waiter.send(Ok(chunk.clone()));
                 }
-                schedule(&mut state, &shared.jobs);
+                schedule(&mut state, &shared.jobs, pos, 3);
             }
         }
     }

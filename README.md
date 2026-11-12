@@ -24,15 +24,20 @@ Where things stand:
   If no portal is near the destination, one is built there, on an obsidian platform if needed, and
   a portal always leads back to the one it last sent you through. Players can't place blocks yet,
   so ops build portals with `/portal`.
-- **Mobs:** zombies, skeletons, spiders and creepers spawn on the surface at night, pigs, cows,
-  sheep and chickens on grass, and zombified piglins in the nether, up to a cap around each
-  player; they despawn when far away. Hostile mobs chase and attack players in survival or
-  adventure (creepers explode, skeletons shoot without a visible arrow), zombies and skeletons
-  burn in daylight, passive mobs flee when hit, and zombified piglins only fight back together.
+- **Mobs:** zombies, skeletons, spiders and creepers spawn in the dark: on the surface at night
+  and in caves at any time. Without a lighting engine, "dark" means no sky above (or night) and
+  no light-giving block within 6 blocks. Herds of pigs, cows, sheep and chickens are placed on
+  grass as chunks load, the way vanilla populates new chunks, and topped up now and then;
+  zombified piglins spawn in the nether. Monsters despawn when far away; animals stay.
+  Mobs find their way with A* pathfinding (stepping up, dropping down, around walls, keeping
+  wandering animals out of water), jump up blocks, turn their bodies gradually, and look at
+  nearby players or around. Hostile mobs need to see a player before chasing them in survival
+  or adventure (creepers explode, skeletons shoot without a visible arrow). Zombies and
+  skeletons burn in daylight; skeletons head for shade and stay there by day. Passive mobs flee
+  when hit, and zombified piglins only fight back together.
   Players can punch mobs (bare-hand damage, as there's no inventory yet), take damage, fall
   damage, regenerate slowly, die, and respawn. `/summon <mob>` and `/time set|query` help testing.
-  The world clock now advances on the server. Mobs walk on block-level physics without
-  pathfinding, and since there is no lighting engine, "dark" means night.
+  The world clock now advances on the server.
 - **Liquids:** water and lava flow like vanilla's: a level weaker per block (lava two per block
   in the overworld, one in the nether), falling straight down, heading for the nearest drop,
   washing away plants and torches, drying up when their source goes, and two water sources make
@@ -40,7 +45,8 @@ Where things stand:
   water makes stone. Water updates every 5 ticks, lava every 30 (10 in the nether). Players in
   lava take damage and keep burning for 15 seconds unless they reach water. Players can't place
   blocks yet, so `/setblock <x> <y> <z> <block>` and `/fill` (both accept `~` coordinates) start
-  things flowing.
+  things flowing. Liquids the world generator left unsettled (springs, cave waterfalls, lava
+  pools) start flowing once their chunk loads near a player, as they would in vanilla.
 - **Tab list:** everyone online with their game mode and ping, updated as players join, leave or
   change mode, under the MOTD and an online count.
 - **Bedrock:** NetherNet signaling with a signed server identity, WebRTC data channels, and the
@@ -102,7 +108,8 @@ range of UDP ports, that isn't supported yet.
   decoration of 3×3 regions that never overlap while running, and a chunk is finished once all
   8 neighbours are decorated. `level.rs` keeps a dimension's block edits (portals) on top of them.
 - `src/game/` – the 20 tick-per-second simulation: world time, player health, mob spawning, AI
-  and combat (`mob.rs`), nether portals (`portal.rs`) and flowing liquids (`liquid.rs`).
+  and combat (`mob.rs`), pathfinding (`path.rs`), nether portals (`portal.rs`) and flowing
+  liquids (`liquid.rs`).
   Connections send it inputs and get
   events back, so it doesn't depend on either protocol.
 - `src/prepare/` – `minerust prepare`
