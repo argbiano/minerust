@@ -6,12 +6,25 @@ pub struct FlatGenerator {
     pub layers: Vec<u16>,
     min_y: i32,
     height: u32,
+    biome: &'static str,
 }
 
 impl FlatGenerator {
     /// Vanilla's default superflat preset: bedrock, two dirt, grass.
     pub fn classic() -> Self {
-        Self { layers: vec![blocks::BEDROCK, blocks::DIRT, blocks::DIRT, blocks::GRASS_BLOCK], min_y: -64, height: 384 }
+        Self {
+            layers: vec![blocks::BEDROCK, blocks::DIRT, blocks::DIRT, blocks::GRASS_BLOCK],
+            min_y: -64,
+            height: 384,
+            biome: "minecraft:plains",
+        }
+    }
+
+    /// A netherrack floor for superflat worlds, which have no nether preset of their own.
+    pub fn nether() -> Self {
+        let mut layers = vec![blocks::BEDROCK];
+        layers.extend([blocks::NETHERRACK; 31]);
+        Self { layers, min_y: 0, height: 256, biome: "minecraft:nether_wastes" }
     }
 }
 
@@ -26,7 +39,7 @@ impl Generator for FlatGenerator {
             height: self.height,
             sea_level: self.min_y + self.layers.len() as i32 - 1,
             is_flat: true,
-            biome_names: vec!["minecraft:plains".into()],
+            biome_names: vec![self.biome.into()],
         }
     }
 

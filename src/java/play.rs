@@ -8,8 +8,10 @@ use super::{
 };
 use crate::{
     commands::{self, Source},
+    game::Input,
     players::{Color, Event},
     server::{GameMode, Server},
+    world::{Dimension, Level},
 };
 use anyhow::{Context, Result, bail};
 use std::{
@@ -29,7 +31,7 @@ use uuid::Uuid;
 const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(10);
 const KEEP_ALIVE_TIMEOUT: Duration = Duration::from_secs(30);
 
-type Encoded = ((i32, i32), Vec<u8>);
+type Encoded = ((Dimension, i32, i32), Vec<u8>);
 
 struct Out {
     writer: OwnedWriteHalf,
@@ -48,6 +50,15 @@ pub struct Player {
     pub events: mpsc::UnboundedReceiver<Event>,
 }
 
+/// Tells the game loop the player is gone, however the connection ends.
+struct Leave<'a>(&'a Server, Uuid);
+
+impl Drop for Leave<'_> {
+    fn drop(&mut self) {
+        self.0.game.send(Input::Leave { uuid: self.1 });
+    }
+}
+
 pub async fn run(
     server: Arc<Server>,
     vanilla: Arc<VanillaData>,
@@ -58,75 +69,76 @@ pub async fn run(
 ) -> Result<()> {
     let mut out = Out { writer, compression };
     let cfg = &server.config;
-    let world = server.chunks.info();
     let mut op_level = server.access.op_level(player.uuid, &player.name);
+    let mut gamemode = server.players.get(player.uuid).map_or(cfg.gamemode, |p| p.gamemode());
+    let mut dimension = Dimension::Overworld;
 
     let entity_id = server.next_entity_id.fetch_add(1, Ordering::Relaxed);
     let mut w = Writer::new();
     w.i32(entity_id).bool(false); // hardcore
-    w.varint(1).string("minecraft:overworld"); // levels
+    w.varint(2).string(Dimension::Overworld.name()).string(Dimension::Nether.name()); // levels
     w.varint(cfg.max_players).varint(cfg.view_distance).varint(cfg.view_distance);
     w.bool(false).bool(true).bool(false); // reduced debug info, death screen, limited crafting
-    // CommonPlayerSpawnInfo
-    w.varint(vanilla.overworld_dimension_type).string("minecraft:overworld");
-    w.i64(0); // hashed seed
-    w.varint(cfg.gamemode.java_id());
-    w.varint(0); // previous game mode: none
-    w.bool(false).bool(world.is_flat); // debug, flat
-    w.bool(false); // no last death location
-    w.varint(0).varint(world.sea_level); // portal cooldown
+    spawn_info(&mut w, &vanilla, server.level(dimension), gamemode);
     w.bool(false).bool(false); // online mode, enforces secure chat
     out.send(play::CB_LOGIN, &w.buf).await?;
 
     // Keeps the client on the loading screen until the chunk it stands in arrives.
     out.send(play::CB_GAME_EVENT, &Writer::new().u8(13).f32(0.0).buf).await?;
-
-    // Without a clock state the client renders the overworld at night. Time doesn't
-    // advance on the server yet, so start at noon and let the client run the clock.
-    let mut w = Writer::new();
-    w.i64(0).varint(1).varint(vanilla.overworld_clock);
-    w.varlong(6000).f32(0.0).f32(1.0); // total ticks, partial tick, rate
-    out.send(play::CB_SET_TIME, &w.buf).await?;
+    out.send(play::CB_SET_TIME, &set_time(&vanilla, server.time.load(Ordering::Relaxed))).await?;
 
     let [sx, sy, sz] = server.spawn;
-    let mut w = Writer::new();
-    w.varint(1).f64(sx).f64(sy).f64(sz).f64(0.0).f64(0.0).f64(0.0).f32(0.0).f32(0.0).i32(0);
-    out.send(play::CB_PLAYER_POSITION, &w.buf).await?;
+    let mut teleport_id = 1;
+    out.send(play::CB_PLAYER_POSITION, &teleport(teleport_id, [sx, sy, sz], 0.0)).await?;
+    // Movement from before the client accepted a teleport is from the old position.
+    let mut awaiting_teleport = Some(teleport_id);
 
-    out.send(play::CB_PLAYER_ABILITIES, &abilities(cfg.gamemode)).await?;
+    out.send(play::CB_PLAYER_ABILITIES, &abilities(gamemode)).await?;
     out.send(play::CB_ENTITY_EVENT, &op_event(entity_id, op_level)).await?;
     out.send(play::CB_COMMANDS, &commands_packet(op_level)).await?;
 
-    let biome_ids: Arc<Vec<i32>> = Arc::new(
-        world
-            .biome_names
-            .iter()
-            .map(|name| {
-                vanilla.biome_id(name).unwrap_or_else(|| {
-                    warn!("client registry has no biome {name}, using plains");
-                    vanilla.biome_id("minecraft:plains").unwrap_or(0)
-                })
-            })
-            .collect(),
-    );
     let biome_count = vanilla.biome_names.len();
+    let biome_map = |level: &Level| -> Arc<Vec<i32>> {
+        Arc::new(
+            level
+                .info()
+                .biome_names
+                .iter()
+                .map(|name| {
+                    vanilla.biome_id(name).unwrap_or_else(|| {
+                        warn!("client registry has no biome {name}, using plains");
+                        vanilla.biome_id("minecraft:plains").unwrap_or(0)
+                    })
+                })
+                .collect(),
+        )
+    };
+    let overworld_biomes = biome_map(&server.overworld);
+    let nether_biomes = biome_map(&server.nether);
 
     let mut view = ChunkView::new(cfg.view_distance);
     let mut loading: JoinSet<Result<Encoded>> = JoinSet::new();
-    let request = |loading: &mut JoinSet<Result<Encoded>>, chunks: Vec<(i32, i32)>| {
+    let request = |loading: &mut JoinSet<Result<Encoded>>, dimension: Dimension, chunks: Vec<(i32, i32)>| {
+        let biome_ids = match dimension {
+            Dimension::Overworld => overworld_biomes.clone(),
+            Dimension::Nether => nether_biomes.clone(),
+        };
         for (x, z) in chunks {
-            let store = server.chunks.clone();
+            let server = server.clone();
             let biome_ids = biome_ids.clone();
             loading.spawn(async move {
-                let chunk = store.get(x, z).await?;
-                Ok(((x, z), chunk_packet(&chunk, &biome_ids, biome_count)))
+                let chunk = server.level(dimension).chunk(x, z).await?;
+                Ok(((dimension, x, z), chunk_packet(&chunk, &biome_ids, biome_count)))
             });
         }
     };
 
     let center = chunk_of(sx, sz);
     out.send(play::CB_SET_CHUNK_CACHE_CENTER, &Writer::new().varint(center.0).varint(center.1).buf).await?;
-    request(&mut loading, view.move_to(center).load);
+    request(&mut loading, dimension, view.move_to(center).load);
+
+    server.game.send(Input::Join { uuid: player.uuid, name: player.name.clone(), entity_id });
+    let _leave = Leave(&server, player.uuid);
 
     // Reading is not cancel-safe, so it runs on its own task.
     let (tx, mut rx) = mpsc::channel::<Result<RawPacket>>(64);
@@ -157,20 +169,56 @@ pub async fn run(
                                 pending_keep_alive = None;
                             }
                         }
-                        play::SB_MOVE_PLAYER_POS | play::SB_MOVE_PLAYER_POS_ROT => {
-                            let mut rd = Reader::new(&pkt.body);
-                            let (x, _y, z) = (rd.f64()?, rd.f64()?, rd.f64()?);
-                            if !x.is_finite() || !z.is_finite() {
-                                bail!("invalid position");
+                        play::SB_ACCEPT_TELEPORTATION => {
+                            let id = Reader::new(&pkt.body).varint()?;
+                            if awaiting_teleport == Some(id) {
+                                awaiting_teleport = None;
                             }
-                            let chunk = chunk_of(x, z);
-                            if view.center() != Some(chunk) {
-                                out.send(play::CB_SET_CHUNK_CACHE_CENTER, &Writer::new().varint(chunk.0).varint(chunk.1).buf).await?;
-                                let change = view.move_to(chunk);
-                                for (fx, fz) in change.forget {
-                                    out.send(play::CB_FORGET_LEVEL_CHUNK, &Writer::new().i64(pack_chunk(fx, fz)).buf).await?;
+                        }
+                        play::SB_MOVE_PLAYER_POS | play::SB_MOVE_PLAYER_POS_ROT | play::SB_MOVE_PLAYER_ROT | play::SB_MOVE_PLAYER_STATUS_ONLY => {
+                            if awaiting_teleport.is_some() {
+                                continue;
+                            }
+                            let mut rd = Reader::new(&pkt.body);
+                            let pos = if matches!(pkt.id, play::SB_MOVE_PLAYER_POS | play::SB_MOVE_PLAYER_POS_ROT) {
+                                Some([rd.f64()?, rd.f64()?, rd.f64()?])
+                            } else {
+                                None
+                            };
+                            let yaw = if matches!(pkt.id, play::SB_MOVE_PLAYER_POS_ROT | play::SB_MOVE_PLAYER_ROT) {
+                                let (yaw, _pitch) = (rd.f32()?, rd.f32()?);
+                                Some(yaw)
+                            } else {
+                                None
+                            };
+                            let on_ground = rd.u8()? & 1 != 0;
+                            if let Some([x, y, z]) = pos {
+                                if !x.is_finite() || !y.is_finite() || !z.is_finite() {
+                                    bail!("invalid position");
                                 }
-                                request(&mut loading, change.load);
+                                let chunk = chunk_of(x, z);
+                                if view.center() != Some(chunk) {
+                                    out.send(play::CB_SET_CHUNK_CACHE_CENTER, &Writer::new().varint(chunk.0).varint(chunk.1).buf).await?;
+                                    let change = view.move_to(chunk);
+                                    for (fx, fz) in change.forget {
+                                        out.send(play::CB_FORGET_LEVEL_CHUNK, &Writer::new().i64(pack_chunk(fx, fz)).buf).await?;
+                                    }
+                                    request(&mut loading, dimension, change.load);
+                                }
+                            }
+                            if yaw.is_some_and(|y| !y.is_finite()) {
+                                bail!("invalid rotation");
+                            }
+                            server.game.send(Input::Move { uuid: player.uuid, pos, yaw, on_ground });
+                        }
+                        play::SB_ATTACK => {
+                            let target = Reader::new(&pkt.body).varint()?;
+                            server.game.send(Input::Attack { uuid: player.uuid, target });
+                        }
+                        play::SB_CLIENT_COMMAND => {
+                            // 0 is PERFORM_RESPAWN.
+                            if Reader::new(&pkt.body).varint()? == 0 {
+                                server.game.send(Input::Respawn { uuid: player.uuid });
                             }
                         }
                         play::SB_CHAT_COMMAND | play::SB_CHAT_COMMAND_SIGNED => {
@@ -197,6 +245,7 @@ pub async fn run(
                         out.send(play::CB_SYSTEM_CHAT, &system_chat(&text, color)).await?;
                     }
                     Event::GameMode(mode) => {
+                        gamemode = mode;
                         out.send(play::CB_GAME_EVENT, &Writer::new().u8(3).f32(mode.java_id() as f32).buf).await?;
                         out.send(play::CB_PLAYER_ABILITIES, &abilities(mode)).await?;
                     }
@@ -209,6 +258,78 @@ pub async fn run(
                         out.send(play::CB_DISCONNECT, &Writer::new().nbt_text(&reason).buf).await.ok();
                         bail!("kicked: {reason}");
                     }
+                    Event::SpawnMob { id, uuid, type_id, pos, yaw } => {
+                        let mut w = Writer::new();
+                        w.varint(id).uuid(uuid).varint(type_id).f64(pos[0]).f64(pos[1]).f64(pos[2]);
+                        w.u8(0); // velocity: LpVec3's single zero byte
+                        w.u8(0).u8(angle(yaw)).u8(angle(yaw)); // pitch, yaw, head yaw
+                        w.varint(0); // data
+                        out.send(play::CB_ADD_ENTITY, &w.buf).await?;
+                    }
+                    Event::MoveEntity { id, pos, yaw, on_ground } => {
+                        let mut w = Writer::new();
+                        w.varint(id).varint(0); // PositionPath type 0: linear
+                        w.f64(pos[0]).f64(pos[1]).f64(pos[2]);
+                        w.f32(yaw).f32(0.0).bool(on_ground);
+                        out.send(play::CB_ENTITY_POSITION_SYNC, &w.buf).await?;
+                        out.send(play::CB_ROTATE_HEAD, &Writer::new().varint(id).u8(angle(yaw)).buf).await?;
+                    }
+                    Event::RemoveEntities(ids) => {
+                        let mut w = Writer::new();
+                        w.varint(ids.len() as i32);
+                        for id in ids {
+                            w.varint(id);
+                        }
+                        out.send(play::CB_REMOVE_ENTITIES, &w.buf).await?;
+                    }
+                    Event::EntityHurt { id, yaw } => {
+                        out.send(play::CB_HURT_ANIMATION, &Writer::new().varint(id).f32(yaw).buf).await?;
+                    }
+                    Event::EntityStatus { id, status } => {
+                        out.send(play::CB_ENTITY_EVENT, &Writer::new().i32(id).u8(status).buf).await?;
+                    }
+                    Event::EntityOnFire { id, on_fire } => {
+                        // Shared flags: index 0, serializer 0 (byte), bit 0 = on fire; 0xFF ends the list.
+                        let mut w = Writer::new();
+                        w.varint(id).u8(0).varint(0).u8(on_fire as u8).u8(0xFF);
+                        out.send(play::CB_SET_ENTITY_DATA, &w.buf).await?;
+                    }
+                    Event::Swing { id } => {
+                        out.send(play::CB_ANIMATE, &Writer::new().varint(id).u8(0).buf).await?;
+                    }
+                    Event::Health(health) => {
+                        out.send(play::CB_SET_HEALTH, &Writer::new().f32(health).varint(20).f32(5.0).buf).await?;
+                    }
+                    Event::BlockChanged { pos, state } => {
+                        let mut w = Writer::new();
+                        w.i64(pack_block(pos)).varint(state as i32);
+                        out.send(play::CB_BLOCK_UPDATE, &w.buf).await?;
+                    }
+                    Event::ChangeDimension { dimension: to, pos, yaw, death } => {
+                        dimension = to;
+                        let mut w = Writer::new();
+                        spawn_info(&mut w, &vanilla, server.level(to), gamemode);
+                        // Keep attributes and entity data across portals, as vanilla does.
+                        w.u8(if death { 0 } else { 3 });
+                        out.send(play::CB_RESPAWN, &w.buf).await?;
+                        out.send(play::CB_GAME_EVENT, &Writer::new().u8(13).f32(0.0).buf).await?;
+                        out.send(play::CB_PLAYER_ABILITIES, &abilities(gamemode)).await?;
+                        out.send(play::CB_ENTITY_EVENT, &op_event(entity_id, op_level)).await?;
+                        out.send(play::CB_SET_TIME, &set_time(&vanilla, server.time.load(Ordering::Relaxed))).await?;
+
+                        // Chunks of the old dimension are gone on the client; start a fresh view.
+                        loading.abort_all();
+                        view = ChunkView::new(cfg.view_distance);
+                        let center = chunk_of(pos[0], pos[2]);
+                        out.send(play::CB_SET_CHUNK_CACHE_CENTER, &Writer::new().varint(center.0).varint(center.1).buf).await?;
+                        teleport_id += 1;
+                        out.send(play::CB_PLAYER_POSITION, &teleport(teleport_id, pos, yaw)).await?;
+                        awaiting_teleport = Some(teleport_id);
+                        request(&mut loading, dimension, view.move_to(center).load);
+                    }
+                    Event::Time(ticks) => {
+                        out.send(play::CB_SET_TIME, &set_time(&vanilla, ticks)).await?;
+                    }
                 },
                 Some(done) = loading.join_next() => {
                     // Send everything that is ready as one batch.
@@ -218,9 +339,10 @@ pub async fn run(
                     }
                     let mut batch = Vec::new();
                     for r in ready {
-                        let (pos, body) = r??;
+                        let Ok(r) = r else { continue }; // aborted by a dimension change
+                        let ((dim, x, z), body) = r?;
                         // The player may have moved on while this chunk was generating.
-                        if view.contains(pos) {
+                        if dim == dimension && view.contains((x, z)) {
                             batch.push(body);
                         }
                     }
@@ -253,8 +375,48 @@ pub async fn run(
     result
 }
 
+/// CommonPlayerSpawnInfo, shared by the login and respawn packets.
+fn spawn_info(w: &mut Writer, vanilla: &VanillaData, level: &Level, gamemode: GameMode) {
+    let dimension_type = match level.dimension {
+        Dimension::Overworld => vanilla.overworld_dimension_type,
+        Dimension::Nether => vanilla.nether_dimension_type,
+    };
+    let info = level.info();
+    w.varint(dimension_type).string(level.dimension.name());
+    w.i64(0); // hashed seed
+    w.varint(gamemode.java_id());
+    w.varint(0); // previous game mode: none
+    w.bool(false).bool(info.is_flat); // debug, flat
+    w.bool(false); // no last death location
+    w.varint(0).varint(info.sea_level); // portal cooldown, sea level
+}
+
+/// The client runs the clock itself from here at one tick per tick.
+fn set_time(vanilla: &VanillaData, ticks: i64) -> Vec<u8> {
+    let mut w = Writer::new();
+    w.i64(0).varint(1).varint(vanilla.overworld_clock);
+    w.varlong(ticks).f32(0.0).f32(1.0); // total ticks, partial tick, rate
+    w.buf
+}
+
+fn teleport(id: i32, [x, y, z]: [f64; 3], yaw: f32) -> Vec<u8> {
+    let mut w = Writer::new();
+    w.varint(id).f64(x).f64(y).f64(z).f64(0.0).f64(0.0).f64(0.0).f32(yaw).f32(0.0).i32(0);
+    w.buf
+}
+
+/// Mth.packDegrees.
+fn angle(degrees: f32) -> u8 {
+    (degrees * 256.0 / 360.0).floor() as i32 as u8
+}
+
 fn pack_chunk(x: i32, z: i32) -> i64 {
     ((x as u32 as u64) | ((z as u32 as u64) << 32)) as i64
+}
+
+/// BlockPos.asLong: 26 bits x, 26 bits z, 12 bits y.
+fn pack_block([x, y, z]: [i32; 3]) -> i64 {
+    (((x as i64) & 0x3FF_FFFF) << 38) | (((z as i64) & 0x3FF_FFFF) << 12) | ((y as i64) & 0xFFF)
 }
 
 fn system_chat(text: &str, color: Color) -> Vec<u8> {
@@ -293,5 +455,21 @@ mod tests {
         assert_eq!(super::pack_chunk(1, 2), 0x0000_0002_0000_0001);
         assert_eq!(super::pack_chunk(-1, 0), 0x0000_0000_FFFF_FFFF);
         assert_eq!(super::pack_chunk(0, -1), 0xFFFF_FFFF_0000_0000u64 as i64);
+    }
+
+    #[test]
+    fn block_pos_packing_matches_vanilla() {
+        // BlockPos.asLong values computed by vanilla.
+        assert_eq!(super::pack_block([0, 0, 0]), 0);
+        assert_eq!(super::pack_block([1, 2, 3]), 274877919234);
+        assert_eq!(super::pack_block([-1, -64, -1]), -64);
+    }
+
+    #[test]
+    fn angles_pack_like_vanilla() {
+        assert_eq!(super::angle(0.0), 0);
+        assert_eq!(super::angle(90.0), 64);
+        assert_eq!(super::angle(-90.0), 192);
+        assert_eq!(super::angle(359.0), 255);
     }
 }

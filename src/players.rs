@@ -1,7 +1,7 @@
 // Players currently online, whichever edition they joined with, and the way the rest
 // of the server talks to their connection.
 
-use crate::server::GameMode;
+use crate::{server::GameMode, world::Dimension};
 use std::{
     collections::HashMap,
     sync::{
@@ -58,6 +58,53 @@ pub enum Event {
     /// The player's op level changed; command lists and permissions need refreshing.
     Permission(u8),
     Kick(String),
+    /// A mob came into view.
+    SpawnMob {
+        id: i32,
+        uuid: Uuid,
+        type_id: i32,
+        pos: [f64; 3],
+        yaw: f32,
+    },
+    MoveEntity {
+        id: i32,
+        pos: [f64; 3],
+        yaw: f32,
+        on_ground: bool,
+    },
+    RemoveEntities(Vec<i32>),
+    /// Red flash (and camera shake when it is the player's own id).
+    EntityHurt {
+        id: i32,
+        yaw: f32,
+    },
+    /// Vanilla entity event, e.g. 3 for a living entity's death.
+    EntityStatus {
+        id: i32,
+        status: u8,
+    },
+    EntityOnFire {
+        id: i32,
+        on_fire: bool,
+    },
+    /// Main-arm swing animation.
+    Swing {
+        id: i32,
+    },
+    Health(f32),
+    BlockChanged {
+        pos: [i32; 3],
+        state: u16,
+    },
+    /// Moves the player to another dimension, or back to spawn after death.
+    ChangeDimension {
+        dimension: Dimension,
+        pos: [f64; 3],
+        yaw: f32,
+        death: bool,
+    },
+    /// Absolute world time in ticks, after it was changed by a command.
+    Time(i64),
 }
 
 pub struct Player {
@@ -114,6 +161,10 @@ impl Players {
             Player { name: name.to_owned(), uuid, edition, gamemode: AtomicU8::new(gamemode.java_id() as u8), tx };
         online.insert(uuid, std::sync::Arc::new(player));
         Joined::Ok(Registration { players: self, uuid }, rx)
+    }
+
+    pub fn get(&self, uuid: Uuid) -> Option<std::sync::Arc<Player>> {
+        self.online.lock().unwrap().get(&uuid).cloned()
     }
 
     pub fn find(&self, name: &str) -> Option<std::sync::Arc<Player>> {

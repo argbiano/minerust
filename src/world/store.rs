@@ -91,6 +91,10 @@ impl ChunkSource for ChunkStore {
         &self.info
     }
 
+    fn cached(&self, x: i32, z: i32) -> Option<Arc<Chunk>> {
+        self.state.lock().unwrap().loaded.get(&(x, z)).map(|l| l.chunk.clone())
+    }
+
     async fn spawn_point(&self) -> Result<[f64; 3]> {
         self.generator.spawn_point()
     }

@@ -2,10 +2,12 @@
 
 use crate::{
     access::Change,
+    game::{Input, mob::MobKind},
     java::offline_uuid,
     players::{Color, Event},
     server::{GameMode, Server},
 };
+use std::sync::atomic::Ordering;
 use uuid::Uuid;
 
 pub enum Source {
@@ -43,6 +45,9 @@ pub const COMMANDS: &[Spec] = &[
     Spec { name: "deop", level: 3, usage: "/deop <player>" },
     Spec { name: "kick", level: 3, usage: "/kick <player> [reason]" },
     Spec { name: "whitelist", level: 3, usage: "/whitelist <on|off|list|add|remove|reload> [player]" },
+    Spec { name: "summon", level: 2, usage: "/summon <mob>" },
+    Spec { name: "portal", level: 2, usage: "/portal" },
+    Spec { name: "time", level: 2, usage: "/time <set <day|noon|night|midnight|ticks>|query>" },
     Spec { name: "stop", level: 4, usage: "/stop" },
 ];
 
@@ -170,6 +175,40 @@ pub fn execute(server: &Server, source: &Source, line: &str) -> Output {
             }
             Err(e) => err(format!("{e:#}")),
         },
+        ("summon", [kind]) => {
+            let Some(kind) = MobKind::parse(kind) else {
+                let names: Vec<&str> = MobKind::ALL.iter().map(|k| k.name()).collect();
+                return err(format!("Unknown mob. Choose one of: {}", names.join(", ")));
+            };
+            let Source::Player { uuid, .. } = source else { return err("Only players can summon mobs.".into()) };
+            server.game.send(Input::Summon { uuid: *uuid, kind });
+            ok(format!("Summoned new {}", kind.display()))
+        }
+        ("portal", []) => {
+            let Source::Player { uuid, .. } = source else { return err("Only players can build portals.".into()) };
+            server.game.send(Input::BuildPortal { uuid: *uuid });
+            ok("Built a nether portal in front of you".into())
+        }
+        ("time", ["query"]) => {
+            let time = server.time.load(Ordering::Relaxed);
+            ok(format!("The time is {}", time.rem_euclid(24000)))
+        }
+        ("time", ["set", value]) => {
+            let day_time = match *value {
+                "day" => 1000,
+                "noon" => 6000,
+                "night" => 13000,
+                "midnight" => 18000,
+                n => match n.parse::<i64>() {
+                    Ok(n) if n >= 0 => n,
+                    _ => return usage(),
+                },
+            };
+            // Keep the day count, like vanilla's /time set.
+            let now = server.time.load(Ordering::Relaxed);
+            server.game.send(Input::SetTime(now - now.rem_euclid(24000) + day_time));
+            ok(format!("Set the time to {day_time}"))
+        }
         ("stop", []) => {
             server.players.broadcast("Server closed", Color::Yellow);
             for p in server.players.all() {

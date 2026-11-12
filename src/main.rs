@@ -30,15 +30,18 @@ async fn main() -> Result<()> {
     let config = server::Config::load(Path::new("server.properties"))?;
     let server = Arc::new(server::Server::new(config).await?);
 
-    let chunks = server.chunks.clone();
+    let evicting = server.clone();
     tokio::spawn(async move {
         let mut every = tokio::time::interval(std::time::Duration::from_secs(30));
         loop {
             every.tick().await;
-            chunks.evict_idle(std::time::Duration::from_secs(120));
+            for level in [&evicting.overworld, &evicting.nether] {
+                level.source.evict_idle(std::time::Duration::from_secs(120));
+            }
         }
     });
 
+    tokio::spawn(minerust::game::run(server.clone()));
     tokio::spawn(console::run(server.clone()));
     let java = tokio::spawn(java::listen(server.clone()));
     let bedrock = server.config.bedrock_bind.is_some().then(|| tokio::spawn(bedrock::listen(server.clone())));
