@@ -28,7 +28,9 @@ Where things stand:
   and in caves at any time. Without a lighting engine, "dark" means no sky above (or night) and
   no light-giving block within 6 blocks. Herds of pigs, cows, sheep and chickens are placed on
   grass as chunks load, the way vanilla populates new chunks, and topped up now and then;
-  zombified piglins spawn in the nether. Monsters despawn when far away; animals stay.
+  zombified piglins spawn in the nether. Salmon and squid swim in rivers, cod and squid in
+  oceans, tropical fish in warm and lukewarm oceans and salmon in cold ones; stranded fish
+  flop about and suffocate. Monsters and water mobs despawn when far away; farm animals stay.
   Mobs find their way with A* pathfinding (stepping up, dropping down, around walls, keeping
   wandering animals out of water), jump up blocks, turn their bodies gradually, and look at
   nearby players or around. Hostile mobs need to see a player before chasing them in survival
@@ -46,7 +48,15 @@ Where things stand:
   lava take damage and keep burning for 15 seconds unless they reach water. Players can't place
   blocks yet, so `/setblock <x> <y> <z> <block>` and `/fill` (both accept `~` coordinates) start
   things flowing. Liquids the world generator left unsettled (springs, cave waterfalls, lava
-  pools) start flowing once their chunk loads near a player, as they would in vanilla.
+  pools) start flowing once their chunk loads near a player, as they would in vanilla. Seagrass,
+  kelp and waterlogged blocks hold water sources: they feed and spread water like vanilla's.
+- **Breaking blocks:** creative players break anything at once; survival players break
+  hardness-0 blocks (grass, flowers, torches) with one hit and others when their client finishes
+  digging (dig times aren't checked yet), and bedrock and other unbreakable blocks not at all.
+  Hardness comes from the vanilla server (`tools/ExportBreaking.java`). Plants and torches on top
+  come off too, waterlogged blocks and seagrass leave their water behind, and nearby liquids react,
+  so digging a river bank lets the river in. Broken blocks drop nothing yet, and players can't
+  place blocks yet.
 - **Tab list:** everyone online with their game mode and ping, updated as players join, leave or
   change mode, under the MOTD and an online count.
 - **Bedrock:** NetherNet signaling with a signed server identity, WebRTC data channels, and the

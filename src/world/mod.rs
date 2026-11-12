@@ -1,3 +1,4 @@
+pub mod breaking;
 pub mod chunk;
 pub mod flat;
 pub mod level;
@@ -67,6 +68,26 @@ pub mod blocks {
     /// Grass block, snowy or not: where animals spawn.
     pub fn is_grass_block(state: u16) -> bool {
         matches!(state, 8 | GRASS_BLOCK)
+    }
+
+    /// Hardness 0: survival players break it with one hit.
+    pub fn is_instant_break(state: u16) -> bool {
+        in_ranges(super::breaking::INSTANT_BREAK, state)
+    }
+
+    /// Negative hardness: only creative players break it.
+    pub fn is_unbreakable(state: u16) -> bool {
+        in_ranges(super::breaking::UNBREAKABLE, state)
+    }
+
+    /// A block holding a water source: seagrass, kelp, or anything waterlogged.
+    pub fn is_waterlogged(state: u16) -> bool {
+        in_ranges(super::breaking::WATERLOGGED, state)
+    }
+
+    /// Plain water, or water held by seagrass and kelp, that fish can swim through.
+    pub fn is_swimmable(state: u16) -> bool {
+        (WATER..=WATER + 15).contains(&state) || (is_waterlogged(state) && !is_solid(state))
     }
 
     fn in_ranges(ranges: &[(u16, u16)], state: u16) -> bool {

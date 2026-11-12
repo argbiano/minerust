@@ -30,6 +30,11 @@ const MAX_HEALTH: f32 = 20.0;
 const HOSTILE_CAP: usize = 20;
 /// Spots tried per player each second for a monster.
 const HOSTILE_TRIES: usize = 4;
+/// Water mobs around each player (vanilla: 20 water_ambient, 5 water_creature) and spots
+/// tried per second; most of the ring is dry land.
+const FISH_CAP: usize = 20;
+const SQUID_CAP: usize = 5;
+const WATER_TRIES: usize = 6;
 const PASSIVE_CAP: usize = 10;
 /// Newly loaded chunks brought to life per tick, and how far from players (in chunks).
 const SETTLE_PER_TICK: usize = 2;
@@ -57,6 +62,13 @@ pub enum Input {
     Attack {
         uuid: Uuid,
         target: i32,
+    },
+    /// player_action's block digging: answered with the block's state and an ack.
+    Dig {
+        uuid: Uuid,
+        action: Dig,
+        pos: [i32; 3],
+        sequence: i32,
     },
     /// The client pressed "Respawn" on the death screen.
     Respawn {
@@ -87,6 +99,29 @@ pub enum Input {
         uuid: Uuid,
     },
 }
+
+/// Digging steps of player_action, in ServerboundPlayerActionPacket.Action order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Dig {
+    Start,
+    Abort,
+    Stop,
+}
+
+impl Dig {
+    pub fn from_action(action: i32) -> Option<Self> {
+        match action {
+            0 => Some(Self::Start),
+            2 => Some(Self::Abort),
+            3 => Some(Self::Stop),
+            _ => None,
+        }
+    }
+}
+
+/// How far from a player's eyes a block may be dug: vanilla's block interaction range
+/// plus its one-block allowance, measured here to the block's centre.
+const DIG_REACH: f64 = 6.5;
 
 pub struct Handle {
     tx: mpsc::UnboundedSender<Input>,
@@ -246,6 +281,7 @@ impl Game {
             }
             Input::Move { uuid, pos, yaw, on_ground } => self.moved(uuid, pos, yaw, on_ground),
             Input::Attack { uuid, target } => self.attack(uuid, target),
+            Input::Dig { uuid, action, pos, sequence } => self.dig(uuid, action, pos, sequence),
             Input::Respawn { uuid } => self.respawn(uuid),
             Input::Summon { uuid, kind } => {
                 let Some(p) = self.players.get(&uuid) else { return };
@@ -323,6 +359,48 @@ impl Game {
         let damage = if critical { 1.5 } else { 1.0 };
         let from = p.pos;
         self.hurt_mob(target, damage, Some(from), Some(uuid));
+    }
+
+    /// A player breaking a block. Creative players break anything at once; survival players
+    /// break hardness-0 blocks on the first hit and others when the client says it finished
+    /// (dig times aren't checked yet). Whatever happens, the digger gets the block's real
+    /// state and then the ack, so a rejected break shows the block again.
+    fn dig(&mut self, uuid: Uuid, action: Dig, pos: [i32; 3], sequence: i32) {
+        let gamemode = self.gamemode(uuid);
+        let Some(p) = self.players.get(&uuid) else { return };
+        let dimension = p.dimension;
+        let level = self.server.level(dimension);
+        let Some(state) = level.cached_block(pos[0], pos[1], pos[2]) else {
+            self.send(uuid, Event::BlockAck(sequence));
+            return;
+        };
+        let eye = [p.pos[0], p.pos[1] + 1.62, p.pos[2]];
+        let centre = [pos[0] as f64 + 0.5, pos[1] as f64 + 0.5, pos[2] as f64 + 0.5];
+        let allowed = !p.dead
+            && !p.travelling
+            && dist_sq(eye, centre) <= DIG_REACH * DIG_REACH
+            && !blocks::is_air(state)
+            && !(liquid::fluid(state).is_some() && !blocks::is_waterlogged(state));
+        let breaks = allowed
+            && match (gamemode, action) {
+                (GameMode::Creative, Dig::Start) => true,
+                (GameMode::Survival, Dig::Start) => blocks::is_instant_break(state),
+                (GameMode::Survival, Dig::Stop) => !blocks::is_unbreakable(state),
+                _ => false,
+            };
+        if breaks {
+            let edits = broken(level, pos, state);
+            // Everyone else sees the particles and hears the sound; the digger's client makes its own.
+            for (other, q) in &self.players {
+                if *other != uuid && q.dimension == dimension && dist_sq(q.pos, centre) < 64.0 * 64.0 {
+                    self.send(*other, Event::LevelEvent { event: 2001, pos, data: state as i32 });
+                }
+            }
+            self.apply_edits(dimension, &edits);
+        } else {
+            self.send(uuid, Event::BlockChanged { pos, state });
+        }
+        self.send(uuid, Event::BlockAck(sequence));
     }
 
     fn respawn(&mut self, uuid: Uuid) {
@@ -685,6 +763,24 @@ impl Game {
                 continue;
             }
 
+            if mob.kind.is_aquatic() {
+                let dir = swim_think(mob, &block, &mut self.rng);
+                let ahead = [mob.pos[0] + dir[0] * 20.0, mob.pos[1] + dir[1] * 20.0, mob.pos[2] + dir[2] * 20.0];
+                mob.turn([dir[0], dir[2]], (dir != [0.0; 3]).then_some(ahead));
+                if !mob.swim(dir, &block, self.rng.chance(0.1)) {
+                    mob.swim_goal = None;
+                }
+                if mob.in_water(&block) {
+                    mob.air = mob::MAX_AIR;
+                } else {
+                    mob.air = mob.air.saturating_sub(1);
+                    if mob.air == 0 && mob.age.is_multiple_of(20) {
+                        burning.push((mob.id, 2.0));
+                    }
+                }
+                continue;
+            }
+
             let mut ctx = Ctx { level, players: &players, day, rng: &mut self.rng, searches: &mut searches };
             let (walk, look_at) = think(mob, &mut ctx, &mut actions);
             mob.turn(walk, look_at);
@@ -777,11 +873,25 @@ impl Game {
             .map(|(_, p)| (p.dimension, p.pos))
             .collect();
         for (dimension, center) in anchors {
-            let (mut hostile, mut passive) = (0, 0);
+            let (mut hostile, mut passive, mut fish, mut squid) = (0, 0, 0, 0);
             for m in self.mobs.values().filter(|m| m.dimension == dimension && dist_sq(m.pos, center) < 128.0 * 128.0) {
-                match m.kind.temper() {
-                    Temper::Passive => passive += 1,
+                match (m.kind, m.kind.temper()) {
+                    (MobKind::Squid, _) => squid += 1,
+                    (k, _) if k.is_aquatic() => fish += 1,
+                    (_, Temper::Passive) => passive += 1,
                     _ => hostile += 1,
+                }
+            }
+            if dimension == Dimension::Overworld && (fish < FISH_CAP || squid < SQUID_CAP) {
+                for _ in 0..WATER_TRIES {
+                    let (x, z) = self.ring(center);
+                    let Some((pos, biome)) = self.water_spot(dimension, x, z) else { continue };
+                    let Some((kind, group)) = self.water_kind(&biome) else { continue };
+                    let full = if kind == MobKind::Squid { squid >= SQUID_CAP } else { fish >= FISH_CAP };
+                    if !full && !self.near_player(dimension, pos) {
+                        self.spawn_school(kind, dimension, pos, group);
+                        break;
+                    }
                 }
             }
             if hostile < HOSTILE_CAP {
@@ -815,6 +925,84 @@ impl Game {
             40..70 => MobKind::Skeleton,
             70..85 => MobKind::Spider,
             _ => MobKind::Creeper,
+        }
+    }
+
+    /// A spot of open water in column (x, z) for a water mob: a water block with water above,
+    /// somewhere between the river or sea floor and the surface, with its biome's name.
+    fn water_spot(&mut self, dimension: Dimension, x: i32, z: i32) -> Option<([f64; 3], String)> {
+        let level = self.server.level(dimension);
+        let chunk = level.cached_chunk(x >> 4, z >> 4)?;
+        let top = level.cached_surface(x, z)? - 1;
+        let water = |y: i32| level.cached_block(x, y, z).is_some_and(blocks::is_swimmable);
+        if !water(top) {
+            return None;
+        }
+        let floor = (top - 24..top).rev().find(|&y| !water(y)).unwrap_or(top - 24);
+        if top - floor < 2 {
+            return None;
+        }
+        let y = self.rng.range(floor + 1, top);
+        if !water(y) || !water(y + 1) {
+            return None;
+        }
+        let biome = chunk_biome(&chunk, x, y, z).and_then(|id| level.info().biome_names.get(id as usize))?;
+        Some(([x as f64 + 0.5, y as f64, z as f64 + 0.5], biome.clone()))
+    }
+
+    /// What lives in a biome's water, after vanilla's spawn settings, with its group size.
+    fn water_kind(&mut self, biome: &str) -> Option<(MobKind, i32)> {
+        let roll = self.rng.range(0, 100);
+        let biome = biome.trim_start_matches("minecraft:");
+        let kind = if biome.contains("river") {
+            // Rivers: salmon 5, squid 2.
+            if roll < 70 { MobKind::Salmon } else { MobKind::Squid }
+        } else if biome == "warm_ocean" {
+            MobKind::TropicalFish
+        } else if biome.contains("lukewarm_ocean") {
+            match roll {
+                0..55 => MobKind::TropicalFish,
+                55..90 => MobKind::Cod,
+                _ => MobKind::Squid,
+            }
+        } else if biome.contains("frozen") || biome.contains("cold_ocean") {
+            if roll < 70 { MobKind::Salmon } else { MobKind::Cod }
+        } else if biome.contains("ocean") {
+            if roll < 75 { MobKind::Cod } else { MobKind::Squid }
+        } else {
+            return None;
+        };
+        let group = match kind {
+            MobKind::Cod => self.rng.range(3, 7),
+            MobKind::Salmon => self.rng.range(1, 6),
+            MobKind::TropicalFish => 8,
+            _ => self.rng.range(1, 5),
+        };
+        Some((kind, group))
+    }
+
+    /// A school of `group` around `pos`, each in water.
+    fn spawn_school(&mut self, kind: MobKind, dimension: Dimension, pos: [f64; 3], group: i32) {
+        let level = self.server.level(dimension);
+        let mut spots = vec![pos];
+        for _ in 0..group * 3 {
+            if spots.len() >= group as usize {
+                break;
+            }
+            let p = [
+                pos[0] + self.rng.range(-2, 3) as f64,
+                pos[1] + self.rng.range(-1, 2) as f64,
+                pos[2] + self.rng.range(-2, 3) as f64,
+            ];
+            if level
+                .cached_block(p[0].floor() as i32, p[1].floor() as i32, p[2].floor() as i32)
+                .is_some_and(blocks::is_swimmable)
+            {
+                spots.push(p);
+            }
+        }
+        for p in spots {
+            self.spawn(kind, dimension, p);
         }
     }
 
@@ -919,8 +1107,8 @@ impl Game {
     fn despawn_mobs(&mut self) {
         let mut gone = Vec::new();
         for mob in self.mobs.values() {
-            // Vanilla animals stay where they are, however far away players go.
-            if mob.persistent || !mob.alive() || mob.kind.temper() == Temper::Passive {
+            // Vanilla farm animals stay where they are, however far away players go; water mobs don't.
+            if mob.persistent || !mob.alive() || (mob.kind.temper() == Temper::Passive && !mob.kind.is_aquatic()) {
                 continue;
             }
             let nearest = self
@@ -929,7 +1117,7 @@ impl Game {
                 .filter(|p| p.dimension == mob.dimension)
                 .map(|p| dist_sq(p.pos, mob.pos))
                 .fold(f64::INFINITY, f64::min);
-            let far = nearest > 128.0 * 128.0;
+            let far = nearest > mob.kind.despawn_distance().powi(2);
             // Vanilla rolls 1/800 per tick past 32 blocks; this runs every 20 ticks.
             let random = nearest > 32.0 * 32.0 && mob.age > 600;
             if far || (random && self.rng.chance(1.0 / 40.0)) {
@@ -1115,6 +1303,22 @@ impl Game {
     }
 }
 
+/// The block changes from breaking `state` at `pos`: water stays behind where the block held
+/// some, and plants, torches and the like resting on top come off with it.
+fn broken(level: &Level, [x, y, z]: [i32; 3], state: u16) -> Vec<portal::Edit> {
+    let left = |state: u16| if blocks::is_waterlogged(state) { blocks::WATER } else { blocks::AIR };
+    let mut edits = vec![([x, y, z], left(state))];
+    for up in y + 1..y + 16 {
+        match level.cached_block(x, up, z) {
+            Some(above) if blocks::is_instant_break(above) && !blocks::is_solid(above) => {
+                edits.push(([x, up, z], left(above)));
+            }
+            _ => break,
+        }
+    }
+    edits
+}
+
 fn liquid_rules(dimension: Dimension) -> liquid::Rules {
     liquid::Rules { ultrawarm: dimension == Dimension::Nether }
 }
@@ -1250,6 +1454,45 @@ impl Ctx<'_> {
     fn under_sky(&self, [x, y, z]: path::Node) -> bool {
         self.level.cached_surface(x, z).is_some_and(|top| top <= y + 2)
     }
+}
+
+/// Where a water mob swims this tick: off to a random spot of water now and then (vanilla's
+/// RandomSwimmingGoal), straight away from danger when hurt, or nowhere.
+fn swim_think(mob: &mut Mob, block: &impl Fn(i32, i32, i32) -> Option<u16>, rng: &mut Rng) -> [f64; 3] {
+    let speed = mob.kind.speed();
+    if mob.panic > 0 {
+        mob.panic -= 1;
+        let away = [mob.pos[0] - mob.panic_from[0], 0.0, mob.pos[2] - mob.panic_from[2]];
+        let len = (away[0] * away[0] + away[2] * away[2]).sqrt().max(1e-3);
+        mob.swim_goal = None;
+        return [away[0] / len * speed * 2.0, 0.0, away[2] / len * speed * 2.0];
+    }
+    // Fish dart about often, squid drift more slowly.
+    let restless = if mob.kind == MobKind::Squid { 1.0 / 80.0 } else { 1.0 / 30.0 };
+    if mob.swim_goal.is_none() && rng.chance(restless) {
+        for _ in 0..8 {
+            let goal = [
+                mob.pos[0] + rng.range(-8, 9) as f64,
+                mob.pos[1] + rng.range(-3, 4) as f64,
+                mob.pos[2] + rng.range(-8, 9) as f64,
+            ];
+            if block(goal[0].floor() as i32, goal[1].floor() as i32, goal[2].floor() as i32)
+                .is_some_and(blocks::is_swimmable)
+            {
+                mob.swim_goal = Some(goal);
+                break;
+            }
+        }
+    }
+    let Some(goal) = mob.swim_goal else { return [0.0; 3] };
+    let d = [goal[0] - mob.pos[0], goal[1] - mob.pos[1], goal[2] - mob.pos[2]];
+    let len = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+    if len < 0.5 {
+        mob.swim_goal = None;
+        return [0.0; 3];
+    }
+    let step = speed.min(len);
+    [d[0] / len * step, d[1] / len * step, d[2] / len * step]
 }
 
 /// Decides what a mob does this tick: the horizontal step it wants to take and what it
