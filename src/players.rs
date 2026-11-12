@@ -113,9 +113,19 @@ pub struct Player {
     pub edition: Edition,
     gamemode: AtomicU8,
     tx: mpsc::UnboundedSender<Event>,
+    /// Last known dimension and feet position, kept up to date by the connection.
+    location: Mutex<(Dimension, [f64; 3])>,
 }
 
 impl Player {
+    pub fn location(&self) -> (Dimension, [f64; 3]) {
+        *self.location.lock().unwrap()
+    }
+
+    pub fn set_location(&self, dimension: Dimension, pos: [f64; 3]) {
+        *self.location.lock().unwrap() = (dimension, pos);
+    }
+
     pub fn gamemode(&self) -> GameMode {
         GameMode::from_id(self.gamemode.load(Ordering::Relaxed))
     }
@@ -157,8 +167,14 @@ impl Players {
             return Joined::AlreadyOnline;
         }
         let (tx, rx) = mpsc::unbounded_channel();
-        let player =
-            Player { name: name.to_owned(), uuid, edition, gamemode: AtomicU8::new(gamemode.java_id() as u8), tx };
+        let player = Player {
+            name: name.to_owned(),
+            uuid,
+            edition,
+            gamemode: AtomicU8::new(gamemode.java_id() as u8),
+            tx,
+            location: Mutex::new((Dimension::Overworld, [0.0; 3])),
+        };
         online.insert(uuid, std::sync::Arc::new(player));
         Joined::Ok(Registration { players: self, uuid }, rx)
     }

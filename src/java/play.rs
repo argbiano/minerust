@@ -139,6 +139,10 @@ pub async fn run(
 
     server.game.send(Input::Join { uuid: player.uuid, name: player.name.clone(), entity_id });
     let _leave = Leave(&server, player.uuid);
+    let me = server.players.get(player.uuid);
+    if let Some(me) = &me {
+        me.set_location(dimension, server.spawn);
+    }
 
     // Reading is not cancel-safe, so it runs on its own task.
     let (tx, mut rx) = mpsc::channel::<Result<RawPacket>>(64);
@@ -208,6 +212,9 @@ pub async fn run(
                             }
                             if yaw.is_some_and(|y| !y.is_finite()) {
                                 bail!("invalid rotation");
+                            }
+                            if let (Some(me), Some(pos)) = (&me, pos) {
+                                me.set_location(dimension, pos);
                             }
                             server.game.send(Input::Move { uuid: player.uuid, pos, yaw, on_ground });
                         }
@@ -307,6 +314,9 @@ pub async fn run(
                     }
                     Event::ChangeDimension { dimension: to, pos, yaw, death } => {
                         dimension = to;
+                        if let Some(me) = &me {
+                            me.set_location(to, pos);
+                        }
                         let mut w = Writer::new();
                         spawn_info(&mut w, &vanilla, server.level(to), gamemode);
                         // Keep attributes and entity data across portals, as vanilla does.
