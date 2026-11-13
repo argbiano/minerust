@@ -1,7 +1,11 @@
 // Players currently online, whichever edition they joined with, and the way the rest
 // of the server talks to their connection.
 
-use crate::{server::GameMode, world::Dimension};
+use crate::{
+    game::inventory::{SLOTS, Stack},
+    server::GameMode,
+    world::Dimension,
+};
 use std::{
     collections::HashMap,
     sync::{
@@ -123,6 +127,38 @@ pub enum Event {
     TabLatency(Uuid, i32),
     /// Absolute world time in ticks, after it was changed by a command.
     Time(i64),
+    /// The player's whole inventory (container 0) and the stack on the cursor.
+    Inventory {
+        state_id: i32,
+        slots: Box<[Option<Stack>; SLOTS]>,
+        carried: Option<Stack>,
+    },
+    /// The selected hotbar slot, 0-8.
+    HeldSlot(u8),
+    /// A dropped item came into view.
+    SpawnItem {
+        id: i32,
+        uuid: Uuid,
+        pos: [f64; 3],
+        stack: Stack,
+    },
+    /// A dropped item's stack changed size.
+    ItemCount {
+        id: i32,
+        stack: Stack,
+    },
+    /// An entity without a head to turn moved.
+    EntitySync {
+        id: i32,
+        pos: [f64; 3],
+        on_ground: bool,
+    },
+    /// `collector` picked up `amount` of the item entity `item`.
+    TakeItem {
+        item: i32,
+        collector: i32,
+        amount: u8,
+    },
 }
 
 pub struct Player {

@@ -2,9 +2,13 @@
 // despawning), player health, and nether portal travel. Connections feed it `Input`s
 // and it answers through each player's event channel.
 
+mod interact;
+pub mod inventory;
+pub mod items;
 pub mod liquid;
 pub mod mob;
 pub mod path;
+pub mod place;
 pub mod portal;
 
 use crate::{
@@ -12,7 +16,10 @@ use crate::{
     server::{GameMode, Server},
     world::{Chunk, Dimension, Level, blocks},
 };
+use inventory::{ClickMode, Hand, Inventory, Stack};
+use items::ItemEntity;
 use mob::{Look, Mob, MobKind, Rng, Temper};
+use place::Dir;
 use portal::{Portal, PortalKey};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -57,6 +64,7 @@ pub enum Input {
         uuid: Uuid,
         pos: Option<[f64; 3]>,
         yaw: Option<f32>,
+        pitch: Option<f32>,
         on_ground: bool,
     },
     Attack {
@@ -97,6 +105,56 @@ pub enum Input {
     },
     TravelFailed {
         uuid: Uuid,
+    },
+    /// set_carried_item: a hotbar slot, 0-8.
+    SelectSlot {
+        uuid: Uuid,
+        slot: i16,
+    },
+    /// container_click on the inventory screen.
+    Click {
+        uuid: Uuid,
+        slot: i16,
+        button: u8,
+        mode: ClickMode,
+    },
+    CreativeSlot {
+        uuid: Uuid,
+        slot: i16,
+        stack: Option<Stack>,
+    },
+    CloseInventory {
+        uuid: Uuid,
+    },
+    /// Right-click on a block: places the held block.
+    UseItemOn {
+        uuid: Uuid,
+        hand: Hand,
+        pos: [i32; 3],
+        face: Dir,
+        cursor: [f32; 3],
+        sequence: i32,
+    },
+    /// Right-click with an item: buckets.
+    UseItem {
+        uuid: Uuid,
+        hand: Hand,
+        yaw: f32,
+        pitch: f32,
+        sequence: i32,
+    },
+    /// Q: one item, or the whole held stack.
+    DropHeld {
+        uuid: Uuid,
+        all: bool,
+    },
+    SwapHands {
+        uuid: Uuid,
+    },
+    /// Middle-click on a block.
+    PickBlock {
+        uuid: Uuid,
+        pos: [i32; 3],
     },
 }
 
@@ -170,6 +228,8 @@ struct PlayerState {
     /// Ticks left burning after leaving lava.
     fire: u32,
     visible: HashSet<i32>,
+    pitch: f32,
+    inventory: Inventory,
 }
 
 /// Something a mob did that touches other state.
@@ -209,6 +269,9 @@ struct Game {
     liquid_pending: HashSet<(Dimension, liquid::Pos)>,
     /// Chunks whose liquids and animals were already set going.
     settled: HashSet<(Dimension, (i32, i32))>,
+    items: HashMap<i32, ItemEntity>,
+    /// Inventories of players who left, for when they come back.
+    saved: HashMap<Uuid, Inventory>,
 }
 
 impl Game {
@@ -224,6 +287,8 @@ impl Game {
             liquid_queue: BTreeMap::new(),
             liquid_pending: HashSet::new(),
             settled: HashSet::new(),
+            items: HashMap::new(),
+            saved: HashMap::new(),
         }
     }
 
@@ -267,19 +332,31 @@ impl Game {
                         travelling: false,
                         fire: 0,
                         visible: HashSet::new(),
+                        pitch: 0.0,
+                        inventory: self.saved.remove(&uuid).unwrap_or_default(),
                     },
                 );
                 self.send(uuid, Event::Health(MAX_HEALTH));
+                self.sync_inventory(uuid);
             }
             Input::Leave { uuid } => {
-                self.players.remove(&uuid);
+                if let Some(mut p) = self.players.remove(&uuid) {
+                    // Whatever was on the cursor goes back in if it fits.
+                    p.inventory.close();
+                    self.saved.insert(uuid, p.inventory);
+                }
                 for mob in self.mobs.values_mut() {
                     if mob.target == Some(uuid) {
                         mob.target = None;
                     }
                 }
             }
-            Input::Move { uuid, pos, yaw, on_ground } => self.moved(uuid, pos, yaw, on_ground),
+            Input::Move { uuid, pos, yaw, pitch, on_ground } => {
+                if let (Some(p), Some(pitch)) = (self.players.get_mut(&uuid), pitch) {
+                    p.pitch = pitch;
+                }
+                self.moved(uuid, pos, yaw, on_ground)
+            }
             Input::Attack { uuid, target } => self.attack(uuid, target),
             Input::Dig { uuid, action, pos, sequence } => self.dig(uuid, action, pos, sequence),
             Input::Respawn { uuid } => self.respawn(uuid),
@@ -311,6 +388,21 @@ impl Game {
                     p.portal_wait = true;
                 }
             }
+            Input::SelectSlot { uuid, slot } => {
+                if let (Some(p), Ok(slot @ 0..=8)) = (self.players.get_mut(&uuid), usize::try_from(slot)) {
+                    p.inventory.selected = slot;
+                }
+            }
+            Input::Click { uuid, slot, button, mode } => self.click(uuid, slot, button, mode),
+            Input::CreativeSlot { uuid, slot, stack } => self.creative_slot(uuid, slot, stack),
+            Input::CloseInventory { uuid } => self.close_inventory(uuid),
+            Input::UseItemOn { uuid, hand, pos, face, cursor, sequence } => {
+                self.use_item_on(uuid, hand, pos, face, cursor, sequence)
+            }
+            Input::UseItem { uuid, hand, yaw, pitch, sequence } => self.use_item(uuid, hand, yaw, pitch, sequence),
+            Input::DropHeld { uuid, all } => self.drop_held(uuid, all),
+            Input::SwapHands { uuid } => self.swap_hands(uuid),
+            Input::PickBlock { uuid, pos } => self.pick_block(uuid, pos),
         }
     }
 
@@ -354,7 +446,7 @@ impl Game {
         if mob.dimension != p.dimension || dist_sq(eye, mid) > 6.0 * 6.0 {
             return;
         }
-        // Bare hands, as there is no inventory yet; falling hits are critical.
+        // Bare-hand damage whatever is held (weapon damage isn't modelled); falling hits are critical.
         let critical = !p.on_ground && p.fall_peak.is_some_and(|peak| peak > p.pos[1]);
         let damage = if critical { 1.5 } else { 1.0 };
         let from = p.pos;
@@ -389,7 +481,10 @@ impl Game {
                 _ => false,
             };
         if breaks {
-            let edits = broken(level, pos, state);
+            let mut edits = broken(level, pos, state);
+            // What comes off drops as items; a door's or bed's other half goes without a drop.
+            let drops = if gamemode == GameMode::Survival { self.drops(uuid, dimension, &edits) } else { Vec::new() };
+            edits.extend(interact::other_half(level, pos, state));
             // Everyone else sees the particles and hears the sound; the digger's client makes its own.
             for (other, q) in &self.players {
                 if *other != uuid && q.dimension == dimension && dist_sq(q.pos, centre) < 64.0 * 64.0 {
@@ -397,6 +492,9 @@ impl Game {
                 }
             }
             self.apply_edits(dimension, &edits);
+            for (at, stack) in drops {
+                self.spawn_drop(dimension, at, stack);
+            }
         } else {
             self.send(uuid, Event::BlockChanged { pos, state });
         }
@@ -518,6 +616,7 @@ impl Game {
         self.tick_liquids();
         self.tick_players();
         self.tick_mobs(time);
+        self.tick_items();
         if self.ticks.is_multiple_of(20) {
             self.spawn_mobs(time);
             self.despawn_mobs();
@@ -663,6 +762,7 @@ impl Game {
         self.send(uuid, Event::Health(health));
         if health <= 0.0 {
             self.server.players.broadcast(&format!("{name} {cause}"), Color::White);
+            self.spill_inventory(uuid);
         }
     }
 
@@ -1245,16 +1345,23 @@ impl Game {
         }
 
         let mut sends: Vec<(Uuid, Event)> = Vec::new();
+        for item in self.items.values_mut() {
+            if dist_sq(item.pos, item.sent_pos) > 1e-6 {
+                item.sent_pos = item.pos;
+                moved.push(Event::EntitySync { id: item.id, pos: item.pos, on_ground: item.on_ground });
+            }
+        }
         for (uuid, p) in &mut self.players {
+            let near = |dimension: Dimension, pos: [f64; 3]| {
+                dimension == p.dimension
+                    && (pos[0] - p.pos[0]).powi(2) + (pos[2] - p.pos[2]).powi(2) <= TRACKING_RANGE * TRACKING_RANGE
+            };
             let in_range: HashSet<i32> = self
                 .mobs
                 .values()
-                .filter(|m| {
-                    m.dimension == p.dimension
-                        && (m.pos[0] - p.pos[0]).powi(2) + (m.pos[2] - p.pos[2]).powi(2)
-                            <= TRACKING_RANGE * TRACKING_RANGE
-                })
+                .filter(|m| near(m.dimension, m.pos))
                 .map(|m| m.id)
+                .chain(self.items.values().filter(|i| near(i.dimension, i.pos)).map(|i| i.id))
                 .collect();
             if p.travelling {
                 continue;
@@ -1264,6 +1371,10 @@ impl Game {
                 sends.push((*uuid, Event::RemoveEntities(gone)));
             }
             for &id in in_range.difference(&p.visible) {
+                if let Some(item) = self.items.get(&id) {
+                    sends.push((*uuid, Event::SpawnItem { id, uuid: item.uuid, pos: item.pos, stack: item.stack }));
+                    continue;
+                }
                 let m = &self.mobs[&id];
                 sends.push((
                     *uuid,
@@ -1285,7 +1396,7 @@ impl Game {
                 }
             }
             for event in &moved {
-                let Event::MoveEntity { id, .. } = event else { continue };
+                let (Event::MoveEntity { id, .. } | Event::EntitySync { id, .. }) = event else { continue };
                 if p.visible.contains(id) && in_range.contains(id) {
                     sends.push((*uuid, event.clone()));
                 }
