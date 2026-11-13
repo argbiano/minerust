@@ -8,7 +8,11 @@ use super::{
 };
 use crate::{
     commands::{self, Source},
-    game::{Dig, Input},
+    game::{
+        Dig, Input,
+        inventory::{ClickMode, Hand, Stack},
+        place::Dir,
+    },
     players::{Color, Event, TabEntry},
     server::{GameMode, Server},
     world::{Dimension, Level},
@@ -215,11 +219,11 @@ pub async fn run(
                                 None
                             };
                             let yaw = if matches!(pkt.id, play::SB_MOVE_PLAYER_POS_ROT | play::SB_MOVE_PLAYER_ROT) {
-                                let (yaw, _pitch) = (rd.f32()?, rd.f32()?);
-                                Some(yaw)
+                                Some((rd.f32()?, rd.f32()?))
                             } else {
                                 None
                             };
+                            let (yaw, pitch) = (yaw.map(|r| r.0), yaw.map(|r| r.1));
                             let on_ground = rd.u8()? & 1 != 0;
                             if let Some([x, y, z]) = pos {
                                 if !x.is_finite() || !y.is_finite() || !z.is_finite() {
@@ -236,13 +240,13 @@ pub async fn run(
                                     pump(&mut loading, &mut queue, dimension);
                                 }
                             }
-                            if yaw.is_some_and(|y| !y.is_finite()) {
+                            if yaw.is_some_and(|y| !y.is_finite()) || pitch.is_some_and(|p| !p.is_finite()) {
                                 bail!("invalid rotation");
                             }
                             if let (Some(me), Some(pos)) = (&me, pos) {
                                 me.set_location(dimension, pos);
                             }
-                            server.game.send(Input::Move { uuid: player.uuid, pos, yaw, on_ground });
+                            server.game.send(Input::Move { uuid: player.uuid, pos, yaw, pitch, on_ground });
                         }
                         play::SB_ATTACK => {
                             let target = Reader::new(&pkt.body).varint()?;
@@ -254,9 +258,74 @@ pub async fn run(
                             let pos = unpack_block(rd.i64()?);
                             let _face = rd.u8()?;
                             let sequence = rd.varint()?;
-                            if let Some(action) = Dig::from_action(action) {
-                                server.game.send(Input::Dig { uuid: player.uuid, action, pos, sequence });
+                            let uuid = player.uuid;
+                            match action {
+                                4 | 5 => server.game.send(Input::DropHeld { uuid, all: action == 4 }),
+                                7 => server.game.send(Input::SwapHands { uuid }),
+                                _ => {
+                                    if let Some(action) = Dig::from_action(action) {
+                                        server.game.send(Input::Dig { uuid, action, pos, sequence });
+                                    }
+                                }
                             }
+                        }
+                        play::SB_SET_CARRIED_ITEM => {
+                            let slot = Reader::new(&pkt.body).u16()? as i16;
+                            server.game.send(Input::SelectSlot { uuid: player.uuid, slot });
+                        }
+                        play::SB_CONTAINER_CLICK => {
+                            let mut rd = Reader::new(&pkt.body);
+                            let container = rd.varint()?;
+                            let _state_id = rd.varint()?;
+                            let slot = rd.u16()? as i16;
+                            let button = rd.u8()?;
+                            // The client's predicted slots that follow are ignored: the server
+                            // works the click out itself and sends the result back.
+                            if container == 0
+                                && let Some(mode) = ClickMode::from_id(rd.varint()?)
+                            {
+                                server.game.send(Input::Click { uuid: player.uuid, slot, button, mode });
+                            }
+                        }
+                        play::SB_CONTAINER_CLOSE => {
+                            server.game.send(Input::CloseInventory { uuid: player.uuid });
+                        }
+                        play::SB_SET_CREATIVE_MODE_SLOT => {
+                            let mut rd = Reader::new(&pkt.body);
+                            let slot = rd.u16()? as i16;
+                            let count = rd.varint()?;
+                            // Item components after the id aren't kept.
+                            let stack = if count > 0 {
+                                let item = rd.varint()?;
+                                u16::try_from(item).ok().map(|item| Stack::new(item, count.min(99) as u8))
+                            } else {
+                                None
+                            };
+                            server.game.send(Input::CreativeSlot { uuid: player.uuid, slot, stack });
+                        }
+                        play::SB_USE_ITEM_ON => {
+                            let mut rd = Reader::new(&pkt.body);
+                            let hand = if rd.varint()? == 1 { Hand::Off } else { Hand::Main };
+                            let pos = unpack_block(rd.i64()?);
+                            let face = Dir::from_id(rd.varint()?).context("bad direction")?;
+                            let cursor = [rd.f32()?, rd.f32()?, rd.f32()?];
+                            let (_inside, _world_border) = (rd.bool()?, rd.bool()?);
+                            let sequence = rd.varint()?;
+                            if cursor.iter().any(|c| !c.is_finite()) {
+                                bail!("invalid cursor");
+                            }
+                            server.game.send(Input::UseItemOn { uuid: player.uuid, hand, pos, face, cursor, sequence });
+                        }
+                        play::SB_USE_ITEM => {
+                            let mut rd = Reader::new(&pkt.body);
+                            let hand = if rd.varint()? == 1 { Hand::Off } else { Hand::Main };
+                            let sequence = rd.varint()?;
+                            let (yaw, pitch) = (rd.f32()?, rd.f32()?);
+                            server.game.send(Input::UseItem { uuid: player.uuid, hand, yaw, pitch, sequence });
+                        }
+                        play::SB_PICK_ITEM_FROM_BLOCK => {
+                            let pos = unpack_block(Reader::new(&pkt.body).i64()?);
+                            server.game.send(Input::PickBlock { uuid: player.uuid, pos });
                         }
                         play::SB_CLIENT_COMMAND => {
                             // 0 is PERFORM_RESPAWN.
@@ -412,6 +481,39 @@ pub async fn run(
                     Event::Time(ticks) => {
                         out.send(play::CB_SET_TIME, &set_time(&vanilla, ticks)).await?;
                     }
+                    Event::Inventory { state_id, slots, carried } => {
+                        let mut w = Writer::new();
+                        w.varint(0).varint(state_id).varint(slots.len() as i32);
+                        for stack in slots.iter() {
+                            item_stack(&mut w, *stack);
+                        }
+                        item_stack(&mut w, carried);
+                        out.send(play::CB_CONTAINER_SET_CONTENT, &w.buf).await?;
+                    }
+                    Event::HeldSlot(slot) => {
+                        out.send(play::CB_SET_HELD_SLOT, &Writer::new().varint(slot as i32).buf).await?;
+                    }
+                    Event::SpawnItem { id, uuid, pos, stack } => {
+                        let mut w = Writer::new();
+                        w.varint(id).uuid(uuid).varint(ITEM_ENTITY_TYPE).f64(pos[0]).f64(pos[1]).f64(pos[2]);
+                        w.u8(0).u8(0).u8(0).u8(0).varint(0); // velocity, pitch, yaw, head yaw, data
+                        out.send(play::CB_ADD_ENTITY, &w.buf).await?;
+                        out.send(play::CB_SET_ENTITY_DATA, &item_data(id, stack)).await?;
+                    }
+                    Event::ItemCount { id, stack } => {
+                        out.send(play::CB_SET_ENTITY_DATA, &item_data(id, stack)).await?;
+                    }
+                    Event::EntitySync { id, pos, on_ground } => {
+                        let mut w = Writer::new();
+                        w.varint(id).varint(0).f64(pos[0]).f64(pos[1]).f64(pos[2]);
+                        w.f32(0.0).f32(0.0).bool(on_ground);
+                        out.send(play::CB_ENTITY_POSITION_SYNC, &w.buf).await?;
+                    }
+                    Event::TakeItem { item, collector, amount } => {
+                        let mut w = Writer::new();
+                        w.varint(item).varint(collector).varint(amount as i32);
+                        out.send(play::CB_TAKE_ITEM_ENTITY, &w.buf).await?;
+                    }
                 },
                 Some(done) = loading.join_next() => {
                     // Send everything that is ready as one batch.
@@ -520,6 +622,30 @@ fn teleport(id: i32, [x, y, z]: [f64; 3], yaw: f32) -> Vec<u8> {
 /// Mth.packDegrees.
 fn angle(degrees: f32) -> u8 {
     (degrees * 256.0 / 360.0).floor() as i32 as u8
+}
+
+/// minecraft:item in the entity type registry.
+const ITEM_ENTITY_TYPE: i32 = 72;
+
+/// ItemStack.OPTIONAL_STREAM_CODEC without components: count, then item and two empty patch lists.
+fn item_stack(w: &mut Writer, stack: Option<Stack>) {
+    match stack {
+        Some(s) if s.count > 0 => {
+            w.varint(s.count as i32).varint(s.item as i32).varint(0).varint(0);
+        }
+        _ => {
+            w.varint(0);
+        }
+    }
+}
+
+/// set_entity_data for an item entity: ItemEntity.DATA_ITEM is index 8, serializer 7 (item stack).
+fn item_data(id: i32, stack: Stack) -> Vec<u8> {
+    let mut w = Writer::new();
+    w.varint(id).u8(8).varint(7);
+    item_stack(&mut w, Some(stack));
+    w.u8(0xFF);
+    w.buf
 }
 
 fn pack_chunk(x: i32, z: i32) -> i64 {

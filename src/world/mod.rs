@@ -3,6 +3,8 @@ pub mod chunk;
 pub mod flat;
 pub mod level;
 pub mod passable;
+pub mod registry;
+mod registry_data;
 pub mod store;
 pub mod vanilla;
 

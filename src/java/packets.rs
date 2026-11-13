@@ -68,4 +68,14 @@ pub mod play {
     pub const CB_SET_CHUNK_CACHE_CENTER: i32 = 0x60;
     pub const CB_SET_TIME: i32 = 0x73;
     pub const CB_SYSTEM_CHAT: i32 = 0x7C;
+    pub const CB_CONTAINER_SET_CONTENT: i32 = 18;
+    pub const CB_SET_HELD_SLOT: i32 = 107;
+    pub const CB_TAKE_ITEM_ENTITY: i32 = 127;
+    pub const SB_CONTAINER_CLICK: i32 = 18;
+    pub const SB_CONTAINER_CLOSE: i32 = 19;
+    pub const SB_PICK_ITEM_FROM_BLOCK: i32 = 36;
+    pub const SB_SET_CARRIED_ITEM: i32 = 54;
+    pub const SB_SET_CREATIVE_MODE_SLOT: i32 = 57;
+    pub const SB_USE_ITEM_ON: i32 = 66;
+    pub const SB_USE_ITEM: i32 = 67;
 }
