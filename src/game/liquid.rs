@@ -60,11 +60,13 @@ impl Fluid {
     }
 }
 
-/// The liquid in a block state and its level.
+/// The liquid in a block state and its level. Seagrass, kelp and waterlogged blocks hold
+/// a water source: it spreads and feeds neighbours, but the block itself never changes.
 pub fn fluid(state: u16) -> Option<(Fluid, u8)> {
     match state {
         89..=104 => Some((Fluid::Water, (state - 89) as u8)),
         105..=120 => Some((Fluid::Lava, (state - 105) as u8)),
+        _ if blocks::is_waterlogged(state) => Some((Fluid::Water, 0)),
         _ => None,
     }
 }
@@ -188,9 +190,11 @@ pub fn tick(w: &mut impl World, pos: Pos, rules: Rules) {
 fn spread(w: &mut impl World, pos: Pos, f: Fluid, level: u8, rules: Rules) {
     let down = below(pos);
     match w.get(down) {
-        // Lava pouring onto water.
+        // Lava pouring onto water; water held by seagrass or a waterlogged block just stops it.
         Some(state) if f == Fluid::Lava && fluid(state).is_some_and(|(g, _)| g == Fluid::Water) => {
-            w.set(down, blocks::STONE);
+            if !blocks::is_waterlogged(state) {
+                w.set(down, blocks::STONE);
+            }
             return;
         }
         Some(state) if !is_source_of(w, down, f) && can_pass(w, down, f) => {
@@ -268,6 +272,8 @@ fn slope(w: &impl World, pos: Pos, depth: u32, came_from: usize, f: Fluid, rules
 mod tests {
     use super::*;
     use crate::world::blocks::{AIR, COBBLESTONE, GLASS, OBSIDIAN, STONE};
+
+    const SEAGRASS: u16 = 2370;
     use std::collections::{BTreeMap, HashMap, HashSet};
 
     const OVERWORLD: Rules = Rules { ultrawarm: false };
@@ -437,5 +443,26 @@ mod tests {
         assert_eq!(fluid(120), Some((Fluid::Lava, 15)));
         assert_eq!(fluid(STONE), None);
         assert_eq!(Fluid::Lava.state(3), 108);
+        assert_eq!(fluid(SEAGRASS), Some((Fluid::Water, 0)), "seagrass holds water");
+    }
+
+    #[test]
+    fn waterlogged_blocks_feed_water_but_stay_put() {
+        let mut w = Test::default();
+        w.place([0, 0, 0], SEAGRASS);
+        // Something next to it changed, as when a player breaks the bank of a river.
+        w.place([1, 0, 0], AIR);
+        w.settle();
+        assert_eq!(w.get([0, 0, 0]), Some(SEAGRASS));
+        assert_eq!(w.at([1, 0, 0]), Some((Fluid::Water, 1)), "water flows out of the seagrass");
+
+        // Lava falling onto seagrass doesn't turn it into stone.
+        let mut w = Test::default();
+        w.place([0, 0, 0], SEAGRASS);
+        w.place([0, 2, 0], GLASS);
+        w.place([0, 1, 0], Fluid::Lava.state(0));
+        w.place([0, 2, 0], AIR);
+        w.settle();
+        assert_eq!(w.get([0, 0, 0]), Some(SEAGRASS));
     }
 }

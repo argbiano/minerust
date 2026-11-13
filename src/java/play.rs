@@ -8,7 +8,7 @@ use super::{
 };
 use crate::{
     commands::{self, Source},
-    game::Input,
+    game::{Dig, Input},
     players::{Color, Event, TabEntry},
     server::{GameMode, Server},
     world::{Dimension, Level},
@@ -248,6 +248,16 @@ pub async fn run(
                             let target = Reader::new(&pkt.body).varint()?;
                             server.game.send(Input::Attack { uuid: player.uuid, target });
                         }
+                        play::SB_PLAYER_ACTION => {
+                            let mut rd = Reader::new(&pkt.body);
+                            let action = rd.varint()?;
+                            let pos = unpack_block(rd.i64()?);
+                            let _face = rd.u8()?;
+                            let sequence = rd.varint()?;
+                            if let Some(action) = Dig::from_action(action) {
+                                server.game.send(Input::Dig { uuid: player.uuid, action, pos, sequence });
+                            }
+                        }
                         play::SB_CLIENT_COMMAND => {
                             // 0 is PERFORM_RESPAWN.
                             if Reader::new(&pkt.body).varint()? == 0 {
@@ -362,6 +372,14 @@ pub async fn run(
                         let mut w = Writer::new();
                         w.i64(pack_block(pos)).varint(state as i32);
                         out.send(play::CB_BLOCK_UPDATE, &w.buf).await?;
+                    }
+                    Event::BlockAck(sequence) => {
+                        out.send(play::CB_BLOCK_CHANGED_ACK, &Writer::new().varint(sequence).buf).await?;
+                    }
+                    Event::LevelEvent { event, pos, data } => {
+                        let mut w = Writer::new();
+                        w.i32(event).i64(pack_block(pos)).i32(data).bool(false);
+                        out.send(play::CB_LEVEL_EVENT, &w.buf).await?;
                     }
                     Event::ChangeDimension { dimension: to, pos, yaw, death } => {
                         dimension = to;
@@ -513,6 +531,11 @@ fn pack_block([x, y, z]: [i32; 3]) -> i64 {
     (((x as i64) & 0x3FF_FFFF) << 38) | (((z as i64) & 0x3FF_FFFF) << 12) | ((y as i64) & 0xFFF)
 }
 
+/// BlockPos.of: the inverse of `pack_block`, sign-extending each field.
+fn unpack_block(packed: i64) -> [i32; 3] {
+    [(packed >> 38) as i32, (packed << 52 >> 52) as i32, (packed << 26 >> 38) as i32]
+}
+
 fn system_chat(text: &str, color: Color) -> Vec<u8> {
     let mut w = Writer::new();
     w.nbt_colored_text(text, color.name()).bool(false); // not an action bar message
@@ -557,6 +580,9 @@ mod tests {
         assert_eq!(super::pack_block([0, 0, 0]), 0);
         assert_eq!(super::pack_block([1, 2, 3]), 274877919234);
         assert_eq!(super::pack_block([-1, -64, -1]), -64);
+        for pos in [[0, 0, 0], [1, 2, 3], [-1, -64, -1], [29_999_999, 319, -29_999_999], [-123, 7, 456]] {
+            assert_eq!(super::unpack_block(super::pack_block(pos)), pos);
+        }
     }
 
     #[test]

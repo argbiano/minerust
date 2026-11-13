@@ -101,6 +101,14 @@ pub enum Event {
         pos: [i32; 3],
         state: u16,
     },
+    /// Block changes the client predicted up to this sequence number are settled.
+    BlockAck(i32),
+    /// A vanilla level event, e.g. 2001 for block-break particles and sound.
+    LevelEvent {
+        event: i32,
+        pos: [i32; 3],
+        data: i32,
+    },
     /// Moves the player to another dimension, or back to spawn after death.
     ChangeDimension {
         dimension: Dimension,

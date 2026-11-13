@@ -15,6 +15,10 @@ pub enum MobKind {
     Cow,
     Sheep,
     Chicken,
+    Cod,
+    Salmon,
+    TropicalFish,
+    Squid,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -28,7 +32,7 @@ pub enum Temper {
 }
 
 impl MobKind {
-    pub const ALL: [MobKind; 9] = [
+    pub const ALL: [MobKind; 13] = [
         Self::Zombie,
         Self::Skeleton,
         Self::Creeper,
@@ -38,6 +42,10 @@ impl MobKind {
         Self::Cow,
         Self::Sheep,
         Self::Chicken,
+        Self::Cod,
+        Self::Salmon,
+        Self::TropicalFish,
+        Self::Squid,
     ];
 
     /// Entity type name without the `minecraft:` namespace.
@@ -52,6 +60,10 @@ impl MobKind {
             Self::Cow => "cow",
             Self::Sheep => "sheep",
             Self::Chicken => "chicken",
+            Self::Cod => "cod",
+            Self::Salmon => "salmon",
+            Self::TropicalFish => "tropical_fish",
+            Self::Squid => "squid",
         }
     }
 
@@ -72,6 +84,10 @@ impl MobKind {
             Self::Cow => "Cow",
             Self::Sheep => "Sheep",
             Self::Chicken => "Chicken",
+            Self::Cod => "Cod",
+            Self::Salmon => "Salmon",
+            Self::TropicalFish => "Tropical Fish",
+            Self::Squid => "Squid",
         }
     }
 
@@ -87,25 +103,32 @@ impl MobKind {
             Self::Cow => 30,
             Self::Sheep => 114,
             Self::Chicken => 26,
+            Self::Cod => 27,
+            Self::Salmon => 113,
+            Self::TropicalFish => 140,
+            Self::Squid => 130,
         }
     }
 
     pub fn max_health(self) -> f32 {
         match self {
             Self::Spider => 16.0,
-            Self::Pig | Self::Cow => 10.0,
+            Self::Pig | Self::Cow | Self::Squid => 10.0,
             Self::Sheep => 8.0,
             Self::Chicken => 4.0,
+            Self::Cod | Self::Salmon | Self::TropicalFish => 3.0,
             _ => 20.0,
         }
     }
 
-    /// Walking speed in blocks per tick.
+    /// Walking (or swimming) speed in blocks per tick.
     pub fn speed(self) -> f64 {
         match self {
             Self::Spider => 0.13,
             Self::Skeleton | Self::Creeper | Self::Zombie | Self::ZombifiedPiglin => 0.1,
             Self::Pig => 0.09,
+            Self::Cod | Self::Salmon | Self::TropicalFish => 0.08,
+            Self::Squid => 0.05,
             _ => 0.07,
         }
     }
@@ -114,7 +137,21 @@ impl MobKind {
         match self {
             Self::Zombie | Self::Skeleton | Self::Creeper | Self::Spider => Temper::Hostile,
             Self::ZombifiedPiglin => Temper::Neutral,
-            Self::Pig | Self::Cow | Self::Sheep | Self::Chicken => Temper::Passive,
+            _ => Temper::Passive,
+        }
+    }
+
+    /// Lives in water: swims instead of walking and suffocates on land.
+    pub fn is_aquatic(self) -> bool {
+        matches!(self, Self::Cod | Self::Salmon | Self::TropicalFish | Self::Squid)
+    }
+
+    /// Players farther than this can't keep it from despawning (vanilla's mob category
+    /// despawn distance: 64 for fish, 128 for everything else).
+    pub fn despawn_distance(self) -> f64 {
+        match self {
+            Self::Cod | Self::Salmon | Self::TropicalFish => 64.0,
+            _ => 128.0,
         }
     }
 
@@ -141,6 +178,9 @@ impl MobKind {
             Self::Cow => 1.4,
             Self::Sheep => 1.3,
             Self::Chicken => 0.7,
+            Self::Cod => 0.3,
+            Self::Salmon | Self::TropicalFish => 0.4,
+            Self::Squid => 0.8,
         }
     }
 
@@ -148,6 +188,9 @@ impl MobKind {
         self.height() * 0.85
     }
 }
+
+/// Breath a water mob has out of water (vanilla fish: 300 ticks).
+pub const MAX_AIR: u32 = 300;
 
 pub struct Mob {
     pub id: i32,
@@ -186,6 +229,10 @@ pub struct Mob {
     pub look: Option<(Look, u32)>,
     pub fuse: u32,
     pub fire: u32,
+    /// Ticks of breath left out of water, for water mobs.
+    pub air: u32,
+    /// Where a water mob is swimming to.
+    pub swim_goal: Option<[f64; 3]>,
     pub age: u32,
     /// Summoned mobs never despawn on their own.
     pub persistent: bool,
@@ -233,6 +280,8 @@ impl Mob {
             look: None,
             fuse: 0,
             fire: 0,
+            air: MAX_AIR,
+            swim_goal: None,
             age: 0,
             persistent: false,
             sent_pos: pos,
@@ -250,6 +299,42 @@ impl Mob {
     /// The block the mob's feet are in.
     pub fn block_pos(&self) -> path::Node {
         [self.pos[0].floor() as i32, (self.pos[1] + 1e-6).floor() as i32, self.pos[2].floor() as i32]
+    }
+
+    pub fn in_water(&self, block: &impl Fn(i32, i32, i32) -> Option<u16>) -> bool {
+        let y = (self.pos[1] + self.kind.height() / 2.0).floor() as i32;
+        block(self.pos[0].floor() as i32, y, self.pos[2].floor() as i32).is_some_and(blocks::is_swimmable)
+    }
+
+    /// One tick of swimming by `dir` (blocks per tick) plus knockback. The mob only moves
+    /// where its body stays in water; returns false when the way is blocked. Out of water it
+    /// falls and flops about, as stranded fish do.
+    pub fn swim(&mut self, dir: [f64; 3], block: &impl Fn(i32, i32, i32) -> Option<u16>, flop: bool) -> bool {
+        if !self.in_water(block) {
+            if self.on_ground && flop {
+                self.vel[1] = 0.4;
+            }
+            self.step([0.0, 0.0], false, block);
+            return false;
+        }
+        let d = [dir[0] + self.vel[0], dir[1], dir[2] + self.vel[2]];
+        self.vel = [self.vel[0] * 0.6, 0.0, self.vel[2] * 0.6];
+        let next = [self.pos[0] + d[0], self.pos[1] + d[1], self.pos[2] + d[2]];
+        let mid = next[1] + self.kind.height() / 2.0;
+        let lead = |v: f64, d: f64| (v + 0.3 * d.signum()).floor() as i32;
+        let water = [
+            [lead(next[0], d[0]), mid.floor() as i32, lead(next[2], d[2])],
+            [next[0].floor() as i32, mid.floor() as i32, next[2].floor() as i32],
+        ]
+        .iter()
+        .all(|&[x, y, z]| block(x, y, z).is_some_and(blocks::is_swimmable));
+        self.on_ground = false;
+        if water {
+            self.pos = next;
+            true
+        } else {
+            false
+        }
     }
 
     pub fn clear_path(&mut self) {
@@ -572,6 +657,41 @@ mod tests {
         assert_eq!(yaw_towards(0.0, 1.0).rem_euclid(360.0).round(), 0.0); // south
         assert_eq!(yaw_towards(-1.0, 0.0).rem_euclid(360.0).round(), 90.0); // west
         assert_eq!(yaw_towards(0.0, -1.0).rem_euclid(360.0).round(), 180.0); // north
+    }
+
+    #[test]
+    fn fish_stay_in_water_and_flop_on_land() {
+        // Water below y=64 for x < 5, stone floor below y=60.
+        let pond = |x: i32, y: i32, _z: i32| {
+            Some(if y < 60 {
+                STONE
+            } else if y < 64 && x < 5 {
+                WATER
+            } else if y < 61 {
+                STONE
+            } else {
+                AIR
+            })
+        };
+        let mut fish = Mob::new(1, MobKind::Cod, Dimension::Overworld, [0.5, 62.0, 0.5], 0.0);
+        for _ in 0..100 {
+            fish.swim([0.08, 0.0, 0.0], &pond, true);
+        }
+        assert!(fish.pos[0] < 5.0, "swam out of the water to {:?}", fish.pos);
+        assert_eq!(fish.pos[1], 62.0, "no gravity while swimming");
+        assert!(!fish.swim([0.0, 0.1, 0.0], &|_, _, _| Some(WATER), true) || fish.pos[1] > 62.0);
+
+        let mut stranded = Mob::new(2, MobKind::Salmon, Dimension::Overworld, [7.5, 63.0, 0.5], 0.0);
+        let mut peak: f64 = 0.0;
+        for _ in 0..40 {
+            stranded.swim([0.0; 3], &pond, true);
+            peak = peak.max(stranded.pos[1]);
+        }
+        for _ in 0..20 {
+            stranded.swim([0.0; 3], &pond, false);
+        }
+        assert_eq!(stranded.pos[1], 61.0, "fell to the ground");
+        assert!(peak > 61.2, "and flops");
     }
 
     #[test]

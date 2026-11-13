@@ -28,10 +28,13 @@ pub mod configuration {
 pub mod play {
     pub const SB_ACCEPT_TELEPORTATION: i32 = 0x00;
     pub const SB_ATTACK: i32 = 0x01;
+    pub const SB_PLAYER_ACTION: i32 = 0x29;
     pub const SB_CLIENT_COMMAND: i32 = 0x0C;
     pub const SB_MOVE_PLAYER_ROT: i32 = 0x20;
     pub const SB_MOVE_PLAYER_STATUS_ONLY: i32 = 0x21;
     pub const CB_ADD_ENTITY: i32 = 0x01;
+    pub const CB_BLOCK_CHANGED_ACK: i32 = 0x04;
+    pub const CB_LEVEL_EVENT: i32 = 0x2F;
     pub const CB_ANIMATE: i32 = 0x02;
     pub const CB_BLOCK_UPDATE: i32 = 0x08;
     pub const CB_ENTITY_POSITION_SYNC: i32 = 0x23;
